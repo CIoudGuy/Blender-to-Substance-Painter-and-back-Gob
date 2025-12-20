@@ -1,7 +1,7 @@
 bl_info = {
     "name": "GoB SP Bridge",
     "author": "Cloud Guy | cloud_was_taken on Discord",
-    "version": (0, 1, 0),
+    "version": (0, 1, 2),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > GoB SP",
     "description": "Send FBX to Substance 3D Painter and import meshes/textures back",
@@ -322,28 +322,35 @@ def is_version_newer(remote, local):
     return parse_version(remote) > parse_version(local)
 
 
-def fetch_update_info():
+def check_for_updates():
     try:
         with urllib.request.urlopen(UPDATE_URL, timeout=4) as response:
             data = json.load(response)
-    except (OSError, json.JSONDecodeError, urllib.error.URLError):
-        return None
+    except (OSError, json.JSONDecodeError, urllib.error.URLError) as exc:
+        return {"status": "error", "error": str(exc)}
     if not isinstance(data, dict):
-        return None
+        return {"status": "error", "error": "Invalid update data"}
     blender_info = data.get("blender") or {}
     if not isinstance(blender_info, dict):
-        return None
+        return {"status": "error", "error": "Missing Blender update data"}
     remote_version = str(blender_info.get("version") or "").strip()
     if not remote_version:
-        return None
+        return {"status": "error", "error": "Missing remote version"}
     local_version = local_version_string()
     if not is_version_newer(remote_version, local_version):
-        return None
+        return {
+            "status": "none",
+            "local_version": local_version,
+            "remote_version": remote_version,
+        }
     return {
-        "version": remote_version,
-        "download_url": blender_info.get("download_url"),
-        "notes": data.get("notes"),
-        "local_version": local_version,
+        "status": "update",
+        "info": {
+            "version": remote_version,
+            "download_url": blender_info.get("download_url"),
+            "notes": data.get("notes"),
+            "local_version": local_version,
+        },
     }
 
 
@@ -915,21 +922,39 @@ def is_sp_running():
             "Substance 3D Painter.exe" in output)
 
 
-_update_check_started = False
-_update_check_done = False
-_update_check_info = None
+_update_check_in_progress = False
+_update_check_result = None
+_update_check_show_no_update = False
+_last_update_info = None
+_update_status_kind = "idle"
+_update_status_text = "Update: not checked yet"
+_update_status_time = 0.0
+
+
+def _set_update_status(kind, text, info=None):
+    global _update_status_kind
+    global _update_status_text
+    global _update_status_time
+    global _last_update_info
+    _update_status_kind = kind
+    _update_status_text = text
+    _update_status_time = time.time()
+    if info:
+        _last_update_info = info
+    elif kind != "update":
+        _last_update_info = None
 
 
 def _update_worker():
-    global _update_check_done
-    global _update_check_info
-    _update_check_info = fetch_update_info()
-    _update_check_done = True
+    global _update_check_result
+    _update_check_result = check_for_updates()
 
 
 def _show_update_popup(info):
     if not info:
         return
+    global _last_update_info
+    _last_update_info = info
     wm = bpy.context.window_manager
     if not wm:
         return
@@ -950,22 +975,63 @@ def _show_update_popup(info):
     wm.popup_menu(draw, title="GoB SP Bridge Update", icon="INFO")
 
 
+def _show_simple_popup(title, message, icon="INFO"):
+    wm = bpy.context.window_manager
+    if not wm:
+        return
+
+    def draw(self, _context):
+        layout = self.layout
+        for line in str(message).splitlines():
+            if line.strip():
+                layout.label(text=line.strip())
+
+    wm.popup_menu(draw, title=title, icon=icon)
+
+
 def _update_poll():
-    if not _update_check_done:
+    global _update_check_in_progress
+    global _update_check_result
+    global _update_check_show_no_update
+    if _update_check_result is None:
         return 0.5
-    if _update_check_info:
-        _show_update_popup(_update_check_info)
+    result = _update_check_result
+    _update_check_result = None
+    _update_check_in_progress = False
+    if result.get("status") == "update":
+        info = result.get("info")
+        _set_update_status("update", f"Update available: {info['version']}", info=info)
+        _show_update_popup(info)
+    elif _update_check_show_no_update:
+        if result.get("status") == "none":
+            local = result.get("local_version") or local_version_string()
+            _set_update_status("up_to_date", f"Up to date ({local})")
+            _show_simple_popup("GoB SP Bridge", f"You're up to date ({local}).")
+        else:
+            error = result.get("error") or "Update check failed."
+            _set_update_status("error", f"Update check failed: {error}")
+            _show_simple_popup("GoB SP Bridge", error, icon="ERROR")
+    elif result.get("status") == "none":
+        local = result.get("local_version") or local_version_string()
+        _set_update_status("up_to_date", f"Up to date ({local})")
+    else:
+        error = result.get("error") or "Update check failed."
+        _set_update_status("error", f"Update check failed: {error}")
+    _update_check_show_no_update = False
     return None
 
 
-def start_update_check():
-    global _update_check_started
-    if _update_check_started:
+def start_update_check(show_no_update=False):
+    global _update_check_in_progress
+    global _update_check_show_no_update
+    if _update_check_in_progress:
         return
-    _update_check_started = True
+    _update_check_in_progress = True
+    _update_check_show_no_update = show_no_update
+    _set_update_status("checking", "Update: checking...")
     thread = threading.Thread(target=_update_worker, daemon=True)
     thread.start()
-    bpy.app.timers.register(_update_poll, first_interval=2.0)
+    bpy.app.timers.register(_update_poll, first_interval=0.5)
 
 
 class GOBSPPreferences(AddonPreferences):
@@ -1228,14 +1294,23 @@ class GOB_OT_OpenDiscord(Operator):
         return {"FINISHED"}
 
 
+class GOB_OT_CheckUpdates(Operator):
+    bl_idname = "gob_sp.check_updates"
+    bl_label = "Check for Updates"
+
+    def execute(self, _context):
+        start_update_check(show_no_update=True)
+        return {"FINISHED"}
+
+
 class GOB_OT_OpenUpdateURL(Operator):
     bl_idname = "gob_sp.open_update_url"
     bl_label = "Open Update Download"
 
     def execute(self, _context):
-        if not _update_check_info or not _update_check_info.get("download_url"):
+        if not _last_update_info or not _last_update_info.get("download_url"):
             return {"CANCELLED"}
-        bpy.ops.wm.url_open(url=_update_check_info["download_url"])
+        bpy.ops.wm.url_open(url=_last_update_info["download_url"])
         return {"FINISHED"}
 
 
@@ -1252,6 +1327,12 @@ class GOB_PT_Panel(Panel):
         row = layout.row(align=True)
         row.operator(GOB_OT_SendToSP.bl_idname, icon="EXPORT")
         row.operator(GOB_OT_ImportFromSP.bl_idname, icon="IMPORT")
+        update_box = layout.box()
+        update_row = update_box.row(align=True)
+        update_row.label(text=_update_status_text)
+        update_row.operator(GOB_OT_CheckUpdates.bl_idname, text="Check")
+        if _last_update_info and _last_update_info.get("download_url"):
+            update_row.operator(GOB_OT_OpenUpdateURL.bl_idname, text="Download")
         if prefs:
             export_box = layout.box()
             row = export_box.row()
@@ -1319,6 +1400,7 @@ classes = (
     GOB_OT_ClearCacheGlobal,
     GOB_OT_ClearCacheLocal,
     GOB_OT_OpenDiscord,
+    GOB_OT_CheckUpdates,
     GOB_OT_OpenUpdateURL,
     GOB_PT_Panel,
 )

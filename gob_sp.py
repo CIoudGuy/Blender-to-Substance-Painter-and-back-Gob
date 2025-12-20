@@ -24,7 +24,7 @@ UPDATE_URL = (
     "https://raw.githubusercontent.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/"
     "refs/heads/main/version.json"
 )
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.1.2"
 
 EXPORT_FORMATS = [
     ("png", "PNG"),
@@ -375,27 +375,34 @@ def is_version_newer(remote, local):
     return parse_version(remote) > parse_version(local)
 
 
-def fetch_update_info():
+def check_for_updates():
     try:
         with urllib.request.urlopen(UPDATE_URL, timeout=4) as response:
             data = json.load(response)
-    except (OSError, json.JSONDecodeError, urllib.error.URLError):
-        return None
+    except (OSError, json.JSONDecodeError, urllib.error.URLError) as exc:
+        return {"status": "error", "error": str(exc)}
     if not isinstance(data, dict):
-        return None
+        return {"status": "error", "error": "Invalid update data"}
     sp_info = data.get("substance_painter") or {}
     if not isinstance(sp_info, dict):
-        return None
+        return {"status": "error", "error": "Missing Substance Painter update data"}
     remote_version = str(sp_info.get("version") or "").strip()
     if not remote_version:
-        return None
+        return {"status": "error", "error": "Missing remote version"}
     if not is_version_newer(remote_version, PLUGIN_VERSION):
-        return None
+        return {
+            "status": "none",
+            "local_version": PLUGIN_VERSION,
+            "remote_version": remote_version,
+        }
     return {
-        "version": remote_version,
-        "download_url": sp_info.get("download_url"),
-        "notes": data.get("notes"),
-        "local_version": PLUGIN_VERSION,
+        "status": "update",
+        "info": {
+            "version": remote_version,
+            "download_url": sp_info.get("download_url"),
+            "notes": data.get("notes"),
+            "local_version": PLUGIN_VERSION,
+        },
     }
 
 
@@ -420,19 +427,89 @@ def show_update_dialog(info):
         QtGui.QDesktopServices.openUrl(QtCore.QUrl(info["download_url"]))
 
 
-_update_check_started = False
-
-
-def start_update_check():
-    global _update_check_started
-    if _update_check_started:
+def show_update_result(result, show_no_update=False):
+    status = result.get("status") if result else None
+    if status == "update":
+        show_update_dialog(result.get("info"))
         return
-    _update_check_started = True
+    if not show_no_update:
+        return
+    if status == "none":
+        box = QtWidgets.QMessageBox()
+        box.setIcon(QtWidgets.QMessageBox.Information)
+        box.setWindowTitle("GoB Bridge Update")
+        box.setText(f"You're up to date ({PLUGIN_VERSION}).")
+        box.exec()
+        return
+    error = result.get("error") if result else "Update check failed."
+    box = QtWidgets.QMessageBox()
+    box.setIcon(QtWidgets.QMessageBox.Warning)
+    box.setWindowTitle("GoB Bridge Update")
+    box.setText(str(error))
+    box.exec()
+
+
+_update_check_in_progress = False
+_update_status_kind = "idle"
+_update_status_text = "Update: not checked yet"
+_last_update_info = None
+_update_status_callbacks = set()
+
+
+def _notify_update_listeners():
+    for callback in list(_update_status_callbacks):
+        try:
+            callback()
+        except Exception:
+            _update_status_callbacks.discard(callback)
+
+
+def _set_update_status(kind, text, info=None):
+    global _update_status_kind
+    global _update_status_text
+    global _last_update_info
+    _update_status_kind = kind
+    _update_status_text = text
+    if info:
+        _last_update_info = info
+    elif kind != "update":
+        _last_update_info = None
+    _notify_update_listeners()
+
+
+def add_update_listener(callback):
+    if callback:
+        _update_status_callbacks.add(callback)
+
+
+def remove_update_listener(callback):
+    _update_status_callbacks.discard(callback)
+
+
+def start_update_check(show_no_update=False):
+    global _update_check_in_progress
+    if _update_check_in_progress:
+        return
+    _update_check_in_progress = True
+    _set_update_status("checking", "Update: checking...")
 
     def _worker():
-        info = fetch_update_info()
-        if info:
-            QtCore.QTimer.singleShot(0, lambda: show_update_dialog(info))
+        result = check_for_updates()
+
+        def _finish():
+            global _update_check_in_progress
+            _update_check_in_progress = False
+            if result.get("status") == "update":
+                info = result.get("info")
+                _set_update_status("update", f"Update available: {info['version']}", info=info)
+            elif result.get("status") == "none":
+                _set_update_status("up_to_date", f"Up to date ({PLUGIN_VERSION})")
+            else:
+                error = result.get("error") if result else "Update check failed."
+                _set_update_status("error", f"Update check failed: {error}")
+            show_update_result(result, show_no_update=show_no_update)
+
+        QtCore.QTimer.singleShot(0, _finish)
 
     thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
@@ -1197,6 +1274,21 @@ class ExportDialog(QtWidgets.QDialog):
         header.setStyleSheet("font-weight: 600; font-size: 14px;")
         layout.addWidget(header)
 
+        update_bar = QtWidgets.QHBoxLayout()
+        self.update_status_label = QtWidgets.QLabel()
+        self.update_status_label.setText(_update_status_text)
+        self.update_status_label.setStyleSheet("font-weight: 600;")
+        self.update_check_btn = QtWidgets.QPushButton("Check Updates")
+        self.update_download_btn = QtWidgets.QPushButton("Download")
+        self.update_download_btn.setEnabled(False)
+        update_bar.addWidget(self.update_status_label)
+        update_bar.addStretch()
+        update_bar.addWidget(self.update_check_btn)
+        update_bar.addWidget(self.update_download_btn)
+        update_widget = QtWidgets.QWidget()
+        update_widget.setLayout(update_bar)
+        layout.addWidget(update_widget)
+
         preset_bar = QtWidgets.QHBoxLayout()
         preset_bar.addWidget(QtWidgets.QLabel("Bridge preset"))
         self.user_preset_combo = QtWidgets.QComboBox()
@@ -1376,6 +1468,9 @@ class ExportDialog(QtWidgets.QDialog):
         self.save_preset_btn.clicked.connect(self._save_user_preset)
         self.delete_preset_btn.clicked.connect(self._delete_user_preset)
         self.user_preset_combo.currentIndexChanged.connect(self._apply_user_preset_selection)
+        self.update_check_btn.clicked.connect(lambda: start_update_check(show_no_update=True))
+        self.update_download_btn.clicked.connect(self._open_update_download)
+        add_update_listener(self._refresh_update_status)
 
         self._populate_texture_sets()
         self._all_presets = collect_export_presets()
@@ -1384,6 +1479,25 @@ class ExportDialog(QtWidgets.QDialog):
         self._apply_saved_state(self._last_state)
         self._on_textures_toggle(self.textures_cb.isChecked())
         self._loading = False
+        self._refresh_update_status()
+
+    def closeEvent(self, event):
+        remove_update_listener(self._refresh_update_status)
+        super().closeEvent(event)
+
+    def _refresh_update_status(self):
+        self.update_status_label.setText(_update_status_text)
+        info = _last_update_info if _update_status_kind == "update" else None
+        enabled = bool(info and info.get("download_url"))
+        self.update_download_btn.setEnabled(enabled)
+        if enabled:
+            self.update_download_btn.setToolTip(info.get("download_url"))
+        else:
+            self.update_download_btn.setToolTip("")
+
+    def _open_update_download(self):
+        if _last_update_info and _last_update_info.get("download_url"):
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl(_last_update_info["download_url"]))
 
     def _on_textures_toggle(self, enabled):
         active = enabled and self.preset_combo.count() > 0
@@ -1747,18 +1861,23 @@ class QuickPanel(QtWidgets.QWidget):
         layout.setSpacing(2)
         self.import_btn = QtWidgets.QToolButton()
         self.export_btn = QtWidgets.QToolButton()
+        self.update_btn = QtWidgets.QToolButton()
         self.import_btn.setText("GoB Import")
         self.export_btn.setText("GoB Export")
-        for btn in (self.import_btn, self.export_btn):
+        self.update_btn.setText("Check Update")
+        for btn in (self.import_btn, self.export_btn, self.update_btn):
             btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
             btn.setAutoRaise(True)
             btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.import_btn.setToolTip("Import from Blender")
         self.export_btn.setToolTip("Send to Blender")
+        self.update_btn.setToolTip("Check for updates")
         self.import_btn.clicked.connect(import_from_blender)
         self.export_btn.clicked.connect(send_to_blender)
+        self.update_btn.clicked.connect(lambda: start_update_check(show_no_update=True))
         layout.addWidget(self.import_btn)
         layout.addWidget(self.export_btn)
+        layout.addWidget(self.update_btn)
 
 
 def _resolve_export_shelf():
@@ -2063,6 +2182,11 @@ def start_plugin():
     action_send.triggered.connect(send_to_blender)
     sp.ui.add_action(sp.ui.ApplicationMenu.File, action_send)
     _ui_elements.append(action_send)
+
+    action_update = QtGui.QAction("GoB Bridge: Check for Updates")
+    action_update.triggered.connect(lambda: start_update_check(show_no_update=True))
+    sp.ui.add_action(sp.ui.ApplicationMenu.File, action_update)
+    _ui_elements.append(action_update)
 
     try:
         quick_element = _add_quick_panel_ui()
