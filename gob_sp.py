@@ -2,13 +2,12 @@ import json
 import os
 import re
 import shutil
-import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets, QtNetwork
 
 import substance_painter as sp
 import substance_painter.event as sp_event
@@ -24,7 +23,7 @@ UPDATE_URL = (
     "https://raw.githubusercontent.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/"
     "refs/heads/main/version.json"
 )
-PLUGIN_VERSION = "0.1.2"
+PLUGIN_VERSION = "0.1.3"
 
 EXPORT_FORMATS = [
     ("png", "PNG"),
@@ -406,6 +405,32 @@ def check_for_updates():
     }
 
 
+def parse_update_data(data):
+    if not isinstance(data, dict):
+        return {"status": "error", "error": "Invalid update data"}
+    sp_info = data.get("substance_painter") or {}
+    if not isinstance(sp_info, dict):
+        return {"status": "error", "error": "Missing Substance Painter update data"}
+    remote_version = str(sp_info.get("version") or "").strip()
+    if not remote_version:
+        return {"status": "error", "error": "Missing remote version"}
+    if not is_version_newer(remote_version, PLUGIN_VERSION):
+        return {
+            "status": "none",
+            "local_version": PLUGIN_VERSION,
+            "remote_version": remote_version,
+        }
+    return {
+        "status": "update",
+        "info": {
+            "version": remote_version,
+            "download_url": sp_info.get("download_url"),
+            "notes": data.get("notes"),
+            "local_version": PLUGIN_VERSION,
+        },
+    }
+
+
 def show_update_dialog(info):
     if not info:
         return
@@ -450,6 +475,16 @@ def show_update_result(result, show_no_update=False):
 
 
 _update_check_in_progress = False
+_update_check_started_at = 0.0
+_update_check_id = 0
+_update_check_active_id = None
+_update_check_timeout = 8.0
+_update_check_result = None
+_update_poll_timer = None
+_update_check_show_no_update = False
+_update_net_manager = None
+_update_reply = None
+_update_timeout_timer = None
 _update_status_kind = "idle"
 _update_status_text = "Update: not checked yet"
 _last_update_info = None
@@ -488,31 +523,105 @@ def remove_update_listener(callback):
 
 def start_update_check(show_no_update=False):
     global _update_check_in_progress
+    global _update_check_started_at
+    global _update_check_show_no_update
+    global _update_check_result
+    global _update_poll_timer
+    global _update_net_manager
+    global _update_reply
+    global _update_timeout_timer
     if _update_check_in_progress:
-        return
+        if time.time() - _update_check_started_at < _update_check_timeout:
+            return
+        if _update_reply is not None:
+            try:
+                _update_reply.abort()
+            except Exception:
+                pass
+        _update_check_in_progress = False
     _update_check_in_progress = True
+    _update_check_started_at = time.time()
+    _update_check_show_no_update = show_no_update
     _set_update_status("checking", "Update: checking...")
+    _update_check_result = None
 
-    def _worker():
-        result = check_for_updates()
+    if _update_net_manager is None:
+        _update_net_manager = QtNetwork.QNetworkAccessManager()
+    request = QtNetwork.QNetworkRequest(QtCore.QUrl(UPDATE_URL))
+    request.setHeader(QtNetwork.QNetworkRequest.UserAgentHeader, f"GoBBridge/{PLUGIN_VERSION}")
+    _update_reply = _update_net_manager.get(request)
 
-        def _finish():
-            global _update_check_in_progress
-            _update_check_in_progress = False
-            if result.get("status") == "update":
-                info = result.get("info")
-                _set_update_status("update", f"Update available: {info['version']}", info=info)
-            elif result.get("status") == "none":
-                _set_update_status("up_to_date", f"Up to date ({PLUGIN_VERSION})")
-            else:
-                error = result.get("error") if result else "Update check failed."
-                _set_update_status("error", f"Update check failed: {error}")
-            show_update_result(result, show_no_update=show_no_update)
+    def _finish_update_result(result):
+        global _update_check_in_progress
+        global _update_check_result
+        global _update_reply
+        global _update_timeout_timer
+        global _update_check_show_no_update
+        if _update_timeout_timer is not None:
+            try:
+                _update_timeout_timer.stop()
+            except Exception:
+                pass
+            _update_timeout_timer = None
+        if _update_reply is not None:
+            try:
+                _update_reply.deleteLater()
+            except Exception:
+                pass
+            _update_reply = None
+        global _update_poll_timer
+        _update_check_in_progress = False
+        if result.get("status") == "update":
+            info = result.get("info")
+            _set_update_status("update", f"Update available: {info['version']}", info=info)
+        elif result.get("status") == "none":
+            _set_update_status("up_to_date", f"Up to date ({PLUGIN_VERSION})")
+        else:
+            error = result.get("error") if result else "Update check failed."
+            _set_update_status("error", f"Update check failed: {error}")
+        show_update_result(result, show_no_update=_update_check_show_no_update)
+        _update_check_show_no_update = False
 
-        QtCore.QTimer.singleShot(0, _finish)
+    def _handle_reply_finished():
+        global _update_check_result
+        if _update_reply is None:
+            return
+        if _update_reply.error() != QtNetwork.QNetworkReply.NoError:
+            error = _update_reply.errorString()
+            _finish_update_result({"status": "error", "error": error})
+            return
+        try:
+            raw = bytes(_update_reply.readAll())
+            data = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            _finish_update_result({"status": "error", "error": str(exc)})
+            return
+        result = parse_update_data(data)
+        _finish_update_result(result)
 
-    thread = threading.Thread(target=_worker, daemon=True)
-    thread.start()
+    _update_reply.finished.connect(_handle_reply_finished)
+
+    if _update_timeout_timer is not None:
+        try:
+            _update_timeout_timer.stop()
+        except Exception:
+            pass
+        _update_timeout_timer = None
+    _update_timeout_timer = QtCore.QTimer()
+    _update_timeout_timer.setSingleShot(True)
+
+    def _on_timeout():
+        if not _update_check_in_progress:
+            return
+        if _update_reply is not None:
+            try:
+                _update_reply.abort()
+            except Exception:
+                pass
+        _finish_update_result({"status": "error", "error": "Update check timed out"})
+
+    _update_timeout_timer.timeout.connect(_on_timeout)
+    _update_timeout_timer.start(int(_update_check_timeout * 1000))
 
 
 def show_message(title, text, icon=QtWidgets.QMessageBox.Information):
