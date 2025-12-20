@@ -9,7 +9,7 @@ Make sure to install both of them.
 ‎ 
 # Installation
 ## Blender
-Edit > Preferances > Addons > Install from disk > Select the zip or the .py file > Done
+Edit > Preferences > Addons > Install from disk > Select the zip or the .py file > Done
 
 ## Substance Painter
 At the top bar hit Python > Plugins Folder > Drag and drop **the .py FIle** > Go back to Substance Painter > Reload Plugins Folder > Done
