@@ -10,9 +10,13 @@ bl_info = {
 
 import json
 import os
+import re
 import shutil
 import subprocess
+import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import bpy
@@ -26,6 +30,10 @@ BLENDER_EXPORT_FILENAME = "b2sp.fbx"
 BLENDER_HIGH_FILENAME = "b2sp_hi.fbx"
 ACTIVE_SP_INFO_FILENAME = "active_sp.json"
 ACTIVE_SP_INFO_MAX_AGE = 120.0
+UPDATE_URL = (
+    "https://raw.githubusercontent.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/"
+    "refs/heads/main/version.json"
+)
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".tga", ".exr"}
 
@@ -296,6 +304,47 @@ def format_bytes(value):
             return f"{size:.1f} {unit}"
         size /= 1024.0
     return f"{size:.1f} TB"
+
+
+def local_version_string():
+    version = bl_info.get("version")
+    if isinstance(version, (tuple, list)):
+        return ".".join(str(part) for part in version)
+    return str(version or "0.0.0")
+
+
+def parse_version(value):
+    parts = re.findall(r"\d+", str(value))
+    return tuple(int(part) for part in parts) if parts else (0,)
+
+
+def is_version_newer(remote, local):
+    return parse_version(remote) > parse_version(local)
+
+
+def fetch_update_info():
+    try:
+        with urllib.request.urlopen(UPDATE_URL, timeout=4) as response:
+            data = json.load(response)
+    except (OSError, json.JSONDecodeError, urllib.error.URLError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    blender_info = data.get("blender") or {}
+    if not isinstance(blender_info, dict):
+        return None
+    remote_version = str(blender_info.get("version") or "").strip()
+    if not remote_version:
+        return None
+    local_version = local_version_string()
+    if not is_version_newer(remote_version, local_version):
+        return None
+    return {
+        "version": remote_version,
+        "download_url": blender_info.get("download_url"),
+        "notes": data.get("notes"),
+        "local_version": local_version,
+    }
 
 
 def detect_map_type(stem_lower):
@@ -866,6 +915,59 @@ def is_sp_running():
             "Substance 3D Painter.exe" in output)
 
 
+_update_check_started = False
+_update_check_done = False
+_update_check_info = None
+
+
+def _update_worker():
+    global _update_check_done
+    global _update_check_info
+    _update_check_info = fetch_update_info()
+    _update_check_done = True
+
+
+def _show_update_popup(info):
+    if not info:
+        return
+    wm = bpy.context.window_manager
+    if not wm:
+        return
+
+    def draw(self, _context):
+        layout = self.layout
+        layout.label(
+            text=f"Update available: {info['version']} (current {info['local_version']})"
+        )
+        notes = info.get("notes")
+        if notes:
+            for line in str(notes).splitlines():
+                if line.strip():
+                    layout.label(text=line.strip())
+        if info.get("download_url"):
+            layout.operator(GOB_OT_OpenUpdateURL.bl_idname, text="Open Download Page")
+
+    wm.popup_menu(draw, title="GoB SP Bridge Update", icon="INFO")
+
+
+def _update_poll():
+    if not _update_check_done:
+        return 0.5
+    if _update_check_info:
+        _show_update_popup(_update_check_info)
+    return None
+
+
+def start_update_check():
+    global _update_check_started
+    if _update_check_started:
+        return
+    _update_check_started = True
+    thread = threading.Thread(target=_update_worker, daemon=True)
+    thread.start()
+    bpy.app.timers.register(_update_poll, first_interval=2.0)
+
+
 class GOBSPPreferences(AddonPreferences):
     bl_idname = __name__
 
@@ -1126,6 +1228,17 @@ class GOB_OT_OpenDiscord(Operator):
         return {"FINISHED"}
 
 
+class GOB_OT_OpenUpdateURL(Operator):
+    bl_idname = "gob_sp.open_update_url"
+    bl_label = "Open Update Download"
+
+    def execute(self, _context):
+        if not _update_check_info or not _update_check_info.get("download_url"):
+            return {"CANCELLED"}
+        bpy.ops.wm.url_open(url=_update_check_info["download_url"])
+        return {"FINISHED"}
+
+
 class GOB_PT_Panel(Panel):
     bl_label = "GoB SP Bridge"
     bl_idname = "GOB_PT_sp_bridge"
@@ -1206,6 +1319,7 @@ classes = (
     GOB_OT_ClearCacheGlobal,
     GOB_OT_ClearCacheLocal,
     GOB_OT_OpenDiscord,
+    GOB_OT_OpenUpdateURL,
     GOB_PT_Panel,
 )
 
@@ -1213,6 +1327,7 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+    start_update_check()
 
 
 def unregister():

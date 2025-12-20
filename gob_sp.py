@@ -1,7 +1,11 @@
 import json
 import os
+import re
 import shutil
+import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -16,6 +20,11 @@ BLENDER_EXPORT_FILENAME = "b2sp.fbx"
 SP_EXPORT_FILENAME = "sp2b.fbx"
 LOG_FILENAME = "sp_export_log.txt"
 ACTIVE_SP_INFO_FILENAME = "active_sp.json"
+UPDATE_URL = (
+    "https://raw.githubusercontent.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/"
+    "refs/heads/main/version.json"
+)
+PLUGIN_VERSION = "0.1.0"
 
 EXPORT_FORMATS = [
     ("png", "PNG"),
@@ -355,6 +364,78 @@ def find_latest_manifest(bridge_roots, source=None):
                 best_time = mtime
                 best_path = candidate
     return best_path
+
+
+def parse_version(value):
+    parts = re.findall(r"\d+", str(value))
+    return tuple(int(part) for part in parts) if parts else (0,)
+
+
+def is_version_newer(remote, local):
+    return parse_version(remote) > parse_version(local)
+
+
+def fetch_update_info():
+    try:
+        with urllib.request.urlopen(UPDATE_URL, timeout=4) as response:
+            data = json.load(response)
+    except (OSError, json.JSONDecodeError, urllib.error.URLError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    sp_info = data.get("substance_painter") or {}
+    if not isinstance(sp_info, dict):
+        return None
+    remote_version = str(sp_info.get("version") or "").strip()
+    if not remote_version:
+        return None
+    if not is_version_newer(remote_version, PLUGIN_VERSION):
+        return None
+    return {
+        "version": remote_version,
+        "download_url": sp_info.get("download_url"),
+        "notes": data.get("notes"),
+        "local_version": PLUGIN_VERSION,
+    }
+
+
+def show_update_dialog(info):
+    if not info:
+        return
+    box = QtWidgets.QMessageBox()
+    box.setIcon(QtWidgets.QMessageBox.Information)
+    box.setWindowTitle("GoB Bridge Update")
+    box.setText(
+        f"Update available: {info['version']} (current {info['local_version']})"
+    )
+    notes = info.get("notes")
+    if notes:
+        box.setInformativeText(str(notes))
+    open_button = None
+    if info.get("download_url"):
+        open_button = box.addButton("Open Download", QtWidgets.QMessageBox.AcceptRole)
+    box.addButton("Later", QtWidgets.QMessageBox.RejectRole)
+    box.exec()
+    if open_button and box.clickedButton() == open_button:
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl(info["download_url"]))
+
+
+_update_check_started = False
+
+
+def start_update_check():
+    global _update_check_started
+    if _update_check_started:
+        return
+    _update_check_started = True
+
+    def _worker():
+        info = fetch_update_info()
+        if info:
+            QtCore.QTimer.singleShot(0, lambda: show_update_dialog(info))
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
 
 
 def show_message(title, text, icon=QtWidgets.QMessageBox.Information):
@@ -1989,6 +2070,7 @@ def start_plugin():
             _ui_elements.append(quick_element)
     except Exception:
         pass
+    start_update_check()
     write_active_sp_info()
     def _auto_import_poll():
         global _auto_import_last_time
