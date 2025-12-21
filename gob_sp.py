@@ -20,12 +20,12 @@ SP_EXPORT_FILENAME = "sp2b.fbx"
 LOG_FILENAME = "sp_export_log.txt"
 ACTIVE_SP_INFO_FILENAME = "active_sp.json"
 HIGH_POLY_RETRY_DELAY_MS = 800
-HIGH_POLY_RETRY_COUNT = 3
+HIGH_POLY_RETRY_COUNT = 60
 UPDATE_URL = (
     "https://raw.githubusercontent.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/"
     "refs/heads/main/version.json"
 )
-PLUGIN_VERSION = "0.1.3"
+PLUGIN_VERSION = "0.1.4"
 
 EXPORT_FORMATS = [
     ("png", "PNG"),
@@ -656,40 +656,75 @@ def apply_high_poly_mesh(high_path):
     try:
         import substance_painter.baking as baking
         hipoly = high_poly_url(high_path)
-        for texset in sp.textureset.all_texture_sets():
+        texsets = list(sp.textureset.all_texture_sets())
+        if not texsets:
+            return False
+        applied = 0
+        for texset in texsets:
             params = baking.BakingParameters.from_texture_set(texset)
             common = params.common()
             hipoly_prop = common.get("HipolyMesh")
             if hipoly_prop:
                 baking.BakingParameters.set({hipoly_prop: hipoly})
-        return True
+                applied += 1
+        return applied > 0
     except Exception:
         return False
 
 
+_high_poly_retry_timer = None
+_high_poly_retry_path = None
+_high_poly_retry_remaining = 0
+
+
+def _stop_high_poly_retry():
+    global _high_poly_retry_timer
+    global _high_poly_retry_path
+    global _high_poly_retry_remaining
+    if _high_poly_retry_timer is not None:
+        try:
+            _high_poly_retry_timer.stop()
+        except Exception:
+            pass
+    _high_poly_retry_path = None
+    _high_poly_retry_remaining = 0
+
+
 def _queue_high_poly_retry(high_path, retries=HIGH_POLY_RETRY_COUNT):
+    global _high_poly_retry_timer
+    global _high_poly_retry_path
+    global _high_poly_retry_remaining
     if not high_path or retries <= 0:
         return
+    _high_poly_retry_path = high_path
+    _high_poly_retry_remaining = max(_high_poly_retry_remaining, retries)
+    if _high_poly_retry_timer is None:
+        _high_poly_retry_timer = QtCore.QTimer()
+        _high_poly_retry_timer.setInterval(HIGH_POLY_RETRY_DELAY_MS)
 
-    def _attempt(remaining):
-        if apply_high_poly_mesh(high_path):
-            return
-        if remaining <= 0:
-            return
-        QtCore.QTimer.singleShot(
-            HIGH_POLY_RETRY_DELAY_MS,
-            lambda: _attempt(remaining - 1),
-        )
+        def _on_retry():
+            global _high_poly_retry_remaining
+            if not _high_poly_retry_path or _high_poly_retry_remaining <= 0:
+                _stop_high_poly_retry()
+                return
+            if apply_high_poly_mesh(_high_poly_retry_path):
+                _stop_high_poly_retry()
+                return
+            _high_poly_retry_remaining -= 1
+            if _high_poly_retry_remaining <= 0:
+                _stop_high_poly_retry()
 
-    QtCore.QTimer.singleShot(
-        HIGH_POLY_RETRY_DELAY_MS,
-        lambda: _attempt(retries - 1),
-    )
+        _high_poly_retry_timer.timeout.connect(_on_retry)
+    try:
+        _high_poly_retry_timer.start()
+    except Exception:
+        pass
 
 
 def apply_high_poly_when_ready(high_path):
     if not high_path:
         return
+    _queue_high_poly_retry(high_path)
     if sp.project.is_open() and sp.project.is_in_edition_state():
         if not apply_high_poly_mesh(high_path):
             _queue_high_poly_retry(high_path)
