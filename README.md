@@ -20,3 +20,7 @@ At the top bar hit Python > Plugins Folder > Drag and drop **the .py FIle** > Go
 ‎  
 # To update
 Make sure to first **remove completely** the script from Substance Painter then follow the steps in **Installation** again
+
+
+
+### PLEASE REPORT ANY BUGS YOU FIND ⚠️
