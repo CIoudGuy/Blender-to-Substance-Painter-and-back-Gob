@@ -1,11 +1,11 @@
 {
   "blender": {
-    "version": "0.1.5",
-    "download_url": "https://github.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/releases/download/v0.1.5-Blender%2FSP/gob_blender_0.1.5.zip"
+    "version": "0.1.6",
+    "download_url": "https://github.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/releases/download/v0.1.6-Blender%2FSP/gob_blender_0.1.6.zip"
   },
   "substance_painter": {
-    "version": "0.1.5",
-    "download_url": "https://github.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/releases/download/v0.1.5-Blender%2FSP/gob_sp_0.1.5.zip"
+    "version": "0.1.6",
+    "download_url": "https://github.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/releases/download/v0.1.6-Blender%2FSP/gob_sp_0.1.6.zip"
   },
   "notes": "Initial public release."
 }
