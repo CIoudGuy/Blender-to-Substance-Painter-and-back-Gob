@@ -1,7 +1,7 @@
 bl_info = {
     "name": "GoB SP Bridge",
     "author": "Cloud Guy | cloud_was_taken on Discord",
-    "version": (0, 1, 2),
+    "version": (0, 1, 3),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > GoB SP",
     "description": "Send FBX to Substance 3D Painter and import meshes/textures back",
@@ -124,14 +124,18 @@ def is_name_with_suffix(name, suffixes):
 
 
 def collect_low_poly_objects(context, prefs):
+    selected_only = bool(prefs and getattr(prefs, "export_selected_only", False))
     suffixes = parse_suffixes(getattr(prefs, "low_poly_suffixes", ""))
+    search_pool = context.selected_objects if selected_only else context.scene.objects
     if suffixes:
         candidates = [
-            obj for obj in context.scene.objects
+            obj for obj in search_pool
             if obj.type == "MESH" and is_name_with_suffix(obj.name, suffixes)
         ]
         if candidates:
             return candidates
+        if selected_only:
+            return [obj for obj in search_pool if obj.type == "MESH"]
     return [obj for obj in context.selected_objects if obj.type == "MESH"]
 
 
@@ -858,6 +862,11 @@ def collect_high_poly_candidates(context, prefs):
     for obj in context.scene.objects:
         if obj.type == "MESH" and obj.get("gob_high_poly"):
             objects.append(obj)
+    if prefs and getattr(prefs, "export_selected_only", False):
+        selected_names = {
+            obj.name for obj in context.selected_objects if obj.type == "MESH"
+        }
+        objects = [obj for obj in objects if obj.name in selected_names]
     unique = []
     seen = set()
     for obj in objects:
@@ -1054,6 +1063,11 @@ class GOBSPPreferences(AddonPreferences):
         name="Export low poly",
         default=True,
     )
+    export_selected_only: BoolProperty(
+        name="Export Selected Only",
+        description="Limit low/high exports to the current selection",
+        default=False,
+    )
     low_poly_suffixes: StringProperty(
         name="Low Poly Suffixes",
         description="Comma-separated suffixes for low poly objects (must be at end)",
@@ -1168,7 +1182,10 @@ class GOB_OT_SendToSP(Operator):
             high_objects = high_candidates
             if high_objects:
                 high_export_path = project_dir / BLENDER_HIGH_FILENAME
-                export_fbx_objects(high_export_path, high_objects, prefs=prefs)
+                exported = export_fbx_objects(high_export_path, high_objects, prefs=prefs)
+                if not exported or not high_export_path.exists():
+                    self.report({"WARNING"}, "High poly export failed or produced no FBX")
+                    high_export_path = None
 
         manifest_path = project_dir / MANIFEST_FILENAME
         sp_running = is_sp_running()
@@ -1237,6 +1254,29 @@ class GOB_OT_ImportFromSP(Operator):
             apply_textures_to_objects(targets, grouped)
 
         self.report({"INFO"}, "Imported assets from Substance Painter")
+        return {"FINISHED"}
+
+
+class GOB_OT_OpenExportFolder(Operator):
+    bl_idname = "gob_sp.open_export_folder"
+    bl_label = "Open Export Folder"
+
+    def execute(self, context):
+        prefs = get_prefs(context)
+        active_info = find_active_sp_project_info(prefs)
+        target_dir = active_info["project_dir"] if active_info else get_project_dir(context, prefs)
+        if not target_dir:
+            self.report({"ERROR"}, "Export folder is not available")
+            return {"CANCELLED"}
+        ensure_dir(target_dir)
+        try:
+            bpy.ops.wm.path_open(filepath=str(target_dir))
+        except RuntimeError:
+            try:
+                os.startfile(str(target_dir))
+            except OSError:
+                self.report({"ERROR"}, "Failed to open export folder")
+                return {"CANCELLED"}
         return {"FINISHED"}
 
 
@@ -1327,6 +1367,7 @@ class GOB_PT_Panel(Panel):
         row = layout.row(align=True)
         row.operator(GOB_OT_SendToSP.bl_idname, icon="EXPORT")
         row.operator(GOB_OT_ImportFromSP.bl_idname, icon="IMPORT")
+        layout.operator(GOB_OT_OpenExportFolder.bl_idname, icon="FILE_FOLDER")
         update_box = layout.box()
         update_row = update_box.row(align=True)
         update_row.label(text=_update_status_text)
@@ -1340,6 +1381,7 @@ class GOB_PT_Panel(Panel):
             row.prop(prefs, "ui_show_export_settings", icon=icon, emboss=False, text="Export Options")
             if prefs.ui_show_export_settings:
                 col = export_box.column(align=True)
+                col.prop(prefs, "export_selected_only")
                 col.prop(prefs, "export_low_poly")
                 col.prop(prefs, "export_high_poly")
                 if prefs.export_high_poly:
@@ -1397,6 +1439,7 @@ classes = (
     GOBSPPreferences,
     GOB_OT_SendToSP,
     GOB_OT_ImportFromSP,
+    GOB_OT_OpenExportFolder,
     GOB_OT_ClearCacheGlobal,
     GOB_OT_ClearCacheLocal,
     GOB_OT_OpenDiscord,
