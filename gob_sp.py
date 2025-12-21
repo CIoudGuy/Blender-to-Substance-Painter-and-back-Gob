@@ -19,6 +19,8 @@ BLENDER_EXPORT_FILENAME = "b2sp.fbx"
 SP_EXPORT_FILENAME = "sp2b.fbx"
 LOG_FILENAME = "sp_export_log.txt"
 ACTIVE_SP_INFO_FILENAME = "active_sp.json"
+HIGH_POLY_RETRY_DELAY_MS = 800
+HIGH_POLY_RETRY_COUNT = 3
 UPDATE_URL = (
     "https://raw.githubusercontent.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/"
     "refs/heads/main/version.json"
@@ -665,16 +667,38 @@ def apply_high_poly_mesh(high_path):
         return False
 
 
+def _queue_high_poly_retry(high_path, retries=HIGH_POLY_RETRY_COUNT):
+    if not high_path or retries <= 0:
+        return
+
+    def _attempt(remaining):
+        if apply_high_poly_mesh(high_path):
+            return
+        if remaining <= 0:
+            return
+        QtCore.QTimer.singleShot(
+            HIGH_POLY_RETRY_DELAY_MS,
+            lambda: _attempt(remaining - 1),
+        )
+
+    QtCore.QTimer.singleShot(
+        HIGH_POLY_RETRY_DELAY_MS,
+        lambda: _attempt(retries - 1),
+    )
+
+
 def apply_high_poly_when_ready(high_path):
     if not high_path:
         return
     if sp.project.is_open() and sp.project.is_in_edition_state():
-        apply_high_poly_mesh(high_path)
+        if not apply_high_poly_mesh(high_path):
+            _queue_high_poly_retry(high_path)
         return
 
     def _on_enter(_event):
         sp_event.DISPATCHER.disconnect(sp_event.ProjectEditionEntered, _on_enter)
-        apply_high_poly_mesh(high_path)
+        if not apply_high_poly_mesh(high_path):
+            _queue_high_poly_retry(high_path)
 
     sp_event.DISPATCHER.connect(sp_event.ProjectEditionEntered, _on_enter)
 

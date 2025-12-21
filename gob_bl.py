@@ -1,7 +1,7 @@
 bl_info = {
     "name": "GoB SP Bridge",
     "author": "Cloud Guy | cloud_was_taken on Discord",
-    "version": (0, 1, 3),
+    "version": (0, 1, 4),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > GoB SP",
     "description": "Send FBX to Substance 3D Painter and import meshes/textures back",
@@ -632,117 +632,13 @@ def unique_object_name(base):
     return name
 
 
-def _mode_from_context(mode_name):
-    if not mode_name:
-        return "OBJECT"
-    if mode_name.startswith("EDIT_"):
-        return "EDIT"
-    return mode_name
-
-
-def auto_unwrap_objects(objects, only_missing=True):
-    def build_override(obj):
-        wm = bpy.context.window_manager
-        for window in wm.windows:
-            screen = window.screen
-            for area in screen.areas:
-                if area.type != "VIEW_3D":
-                    continue
-                for region in area.regions:
-                    if region.type != "WINDOW":
-                        continue
-                    return {
-                        "window": window,
-                        "screen": screen,
-                        "area": area,
-                        "region": region,
-                        "active_object": obj,
-                        "object": obj,
-                        "selected_objects": [obj],
-                        "selected_editable_objects": [obj],
-                    }
-        return None
-
-    selected = [obj for obj in bpy.context.selected_objects if object_is_valid(obj)]
-    active = bpy.context.view_layer.objects.active
-    prev_mode = bpy.context.mode
-    target_mode = _mode_from_context(prev_mode)
-    try:
-        if target_mode != "OBJECT":
-            bpy.ops.object.mode_set(mode="OBJECT")
-    except RuntimeError:
-        pass
-
-    for obj in objects:
-        if not object_is_valid(obj) or obj.type != "MESH":
-            continue
-        has_uvs = bool(obj.data.uv_layers)
-        if only_missing and has_uvs:
-            continue
-        if not has_uvs:
-            obj.data.uv_layers.new(name="UVMap")
-        for sel in bpy.context.selected_objects:
-            try:
-                sel.select_set(False)
-            except ReferenceError:
-                continue
-        try:
-            obj.select_set(True)
-        except ReferenceError:
-            continue
-        bpy.context.view_layer.objects.active = obj
-        override = build_override(obj)
-        try:
-            angle_limit = 66.0
-            if override:
-                with bpy.context.temp_override(**override):
-                    bpy.ops.object.mode_set(mode="EDIT")
-                    bpy.ops.mesh.select_all(action="SELECT")
-                    try:
-                        bpy.ops.uv.smart_project(angle_limit=angle_limit, island_margin=0.02)
-                    except RuntimeError:
-                        bpy.ops.uv.unwrap(method="ANGLE_BASED", margin=0.02)
-                    bpy.ops.object.mode_set(mode="OBJECT")
-            else:
-                bpy.ops.object.mode_set(mode="EDIT")
-                bpy.ops.mesh.select_all(action="SELECT")
-                try:
-                    bpy.ops.uv.smart_project(angle_limit=angle_limit, island_margin=0.02)
-                except RuntimeError:
-                    bpy.ops.uv.unwrap(method="ANGLE_BASED", margin=0.02)
-                bpy.ops.object.mode_set(mode="OBJECT")
-        except RuntimeError:
-            try:
-                bpy.ops.object.mode_set(mode="OBJECT")
-            except RuntimeError:
-                pass
-
-    for sel in bpy.context.selected_objects:
-        try:
-            sel.select_set(False)
-        except ReferenceError:
-            continue
-    for obj in selected:
-        try:
-            obj.select_set(True)
-        except ReferenceError:
-            continue
-    bpy.context.view_layer.objects.active = active
-    try:
-        if target_mode != "OBJECT":
-            bpy.ops.object.mode_set(mode=target_mode)
-    except RuntimeError:
-        pass
-
-
-def export_fbx_objects(filepath, objects, prefs=None, strip_uvs=False, unwrap_uvs=False):
-    unwrap_uvs = bool(unwrap_uvs) and not strip_uvs
+def export_fbx_objects(filepath, objects, prefs=None, strip_uvs=False):
     export_objs = [obj for obj in objects if object_is_valid(obj) and obj.type == "MESH"]
     if not export_objs:
         return False
     temp_objects = []
     renamed_objects = []
-    if strip_uvs or unwrap_uvs:
+    if strip_uvs:
         for obj in export_objs:
             orig_name = obj.name
             temp_name = unique_object_name(f"{orig_name}__gob_src")
@@ -760,8 +656,6 @@ def export_fbx_objects(filepath, objects, prefs=None, strip_uvs=False, unwrap_uv
     if strip_uvs:
         for obj in export_objs:
             remove_uv_layers(obj.data)
-    if unwrap_uvs:
-        auto_unwrap_objects(export_objs, only_missing=False)
     prev_selected = [obj for obj in bpy.context.selected_objects if object_is_valid(obj)]
     prev_active = bpy.context.view_layer.objects.active
     for obj in prev_selected:
@@ -820,13 +714,12 @@ def export_fbx_objects(filepath, objects, prefs=None, strip_uvs=False, unwrap_uv
     return True
 
 
-def export_selected_fbx(filepath, prefs=None, strip_uvs=False, unwrap_uvs=False):
+def export_selected_fbx(filepath, prefs=None, strip_uvs=False):
     return export_fbx_objects(
         filepath,
         bpy.context.selected_objects,
         prefs=prefs,
         strip_uvs=strip_uvs,
-        unwrap_uvs=unwrap_uvs,
     )
 
 
@@ -834,6 +727,41 @@ def object_has_uvs(obj):
     if obj.type != "MESH":
         return False
     return bool(obj.data.uv_layers)
+
+
+def mesh_triangle_count(obj):
+    if obj.type != "MESH":
+        return 0
+    mesh = obj.data
+    try:
+        mesh.calc_loop_triangles()
+        return len(mesh.loop_triangles)
+    except Exception:
+        try:
+            return len(mesh.polygons)
+        except Exception:
+            return 0
+
+
+def split_meshes_by_triangles(objects):
+    mesh_items = [(obj, mesh_triangle_count(obj)) for obj in objects if obj.type == "MESH"]
+    if not mesh_items:
+        return [], []
+    if len(mesh_items) == 1:
+        return [mesh_items[0][0]], []
+    mesh_items.sort(key=lambda item: item[1])
+    if mesh_items[0][1] == mesh_items[-1][1]:
+        return [obj for obj, _count in mesh_items], []
+    best_index = 0
+    best_gap = -1
+    for idx in range(len(mesh_items) - 1):
+        gap = mesh_items[idx + 1][1] - mesh_items[idx][1]
+        if gap > best_gap:
+            best_gap = gap
+            best_index = idx
+    low = [obj for obj, _count in mesh_items[:best_index + 1]]
+    high = [obj for obj, _count in mesh_items[best_index + 1:]]
+    return low, high
 
 
 def collect_high_poly_objects(context, prefs, low_objects):
@@ -934,10 +862,13 @@ def is_sp_running():
 _update_check_in_progress = False
 _update_check_result = None
 _update_check_show_no_update = False
+_update_check_show_popup = False
 _last_update_info = None
 _update_status_kind = "idle"
 _update_status_text = "Update: not checked yet"
 _update_status_time = 0.0
+_last_export_warning = ""
+_pending_export_popup = False
 
 
 def _set_update_status(kind, text, info=None):
@@ -998,10 +929,127 @@ def _show_simple_popup(title, message, icon="INFO"):
     wm.popup_menu(draw, title=title, icon=icon)
 
 
+def _set_export_warning(message):
+    global _last_export_warning
+    _last_export_warning = message or ""
+
+
+def _queue_export_warning_popup(message):
+    global _pending_export_popup
+    if _pending_export_popup:
+        return
+    _pending_export_popup = True
+
+    def _show_popup():
+        global _pending_export_popup
+        _pending_export_popup = False
+        if message:
+            _show_simple_popup("GoB SP Bridge", message, icon="ERROR")
+        return None
+
+    bpy.app.timers.register(_show_popup, first_interval=0.01)
+
+
+def _enforce_selected_suffix_policy(context, prefs, operator=None):
+    if not (prefs and prefs.export_selected_only and prefs.export_low_poly and prefs.export_high_poly):
+        return True
+    selected_meshes = [obj for obj in context.selected_objects if obj.type == "MESH"]
+    if not selected_meshes:
+        return True
+    if prefs.experimental_auto_split_selected:
+        low_objects, high_objects = split_meshes_by_triangles(selected_meshes)
+        if low_objects and high_objects:
+            _set_export_warning("")
+            return True
+        prefs.export_high_poly = False
+        message = (
+            "Experimental auto-split needs both low and high meshes in the selection "
+            "(different triangle counts). High poly export was turned off."
+        )
+        _set_export_warning(message)
+        if operator:
+            operator.report({"WARNING"}, message)
+        _queue_export_warning_popup(message)
+        return False
+    low_suffixes = parse_suffixes(prefs.low_poly_suffixes) or ["_low"]
+    high_suffixes = parse_suffixes(prefs.high_poly_suffixes) or ["_high"]
+    has_low = False
+    has_high = False
+    has_unknown = False
+    for obj in selected_meshes:
+        is_low = is_name_with_suffix(obj.name, low_suffixes)
+        is_high = is_name_with_suffix(obj.name, high_suffixes)
+        if is_low:
+            has_low = True
+        if is_high:
+            has_high = True
+        if not (is_low or is_high):
+            has_unknown = True
+    if has_low and has_high and not has_unknown:
+        _set_export_warning("")
+        return True
+    prefs.export_high_poly = False
+    message = (
+        "Export Selected Only requires selected meshes named with low/high suffixes "
+        "(for example: _low and _high). High poly export was turned off."
+    )
+    _set_export_warning(message)
+    if operator:
+        operator.report({"WARNING"}, message)
+    _queue_export_warning_popup(message)
+    return False
+
+
+def _on_export_selected_only_update(self, context):
+    if not self.export_selected_only:
+        _set_export_warning("")
+        return
+    _enforce_selected_suffix_policy(context, self)
+
+
+def _on_export_low_poly_update(self, context):
+    if not self.export_low_poly:
+        if self.experimental_auto_split_selected:
+            self.experimental_auto_split_selected = False
+        _set_export_warning("")
+        return
+    if self.experimental_auto_split_selected:
+        _enforce_selected_suffix_policy(context, self)
+
+
+def _on_export_high_poly_update(self, context):
+    if not self.export_high_poly:
+        if self.experimental_auto_split_selected:
+            self.experimental_auto_split_selected = False
+        _set_export_warning("")
+        return
+    _enforce_selected_suffix_policy(context, self)
+
+
+def _on_experimental_auto_split_update(self, context):
+    if not self.experimental_auto_split_selected:
+        if self.export_low_poly:
+            self.export_low_poly = False
+        if self.export_high_poly:
+            self.export_high_poly = False
+        if self.export_selected_only:
+            self.export_selected_only = False
+        _set_export_warning("")
+        return
+    if not self.export_selected_only:
+        self.export_selected_only = True
+    if not self.export_low_poly:
+        self.export_low_poly = True
+    if not self.export_high_poly:
+        self.export_high_poly = True
+    _enforce_selected_suffix_policy(context, self)
+
+
 def _update_poll():
     global _update_check_in_progress
     global _update_check_result
     global _update_check_show_no_update
+    global _update_check_show_popup
     if _update_check_result is None:
         return 0.5
     result = _update_check_result
@@ -1010,7 +1058,8 @@ def _update_poll():
     if result.get("status") == "update":
         info = result.get("info")
         _set_update_status("update", f"Update available: {info['version']}", info=info)
-        _show_update_popup(info)
+        if _update_check_show_popup:
+            _show_update_popup(info)
     elif _update_check_show_no_update:
         if result.get("status") == "none":
             local = result.get("local_version") or local_version_string()
@@ -1027,16 +1076,19 @@ def _update_poll():
         error = result.get("error") or "Update check failed."
         _set_update_status("error", f"Update check failed: {error}")
     _update_check_show_no_update = False
+    _update_check_show_popup = False
     return None
 
 
-def start_update_check(show_no_update=False):
+def start_update_check(show_no_update=False, show_popup=True):
     global _update_check_in_progress
     global _update_check_show_no_update
+    global _update_check_show_popup
     if _update_check_in_progress:
         return
     _update_check_in_progress = True
     _update_check_show_no_update = show_no_update
+    _update_check_show_popup = show_popup
     _set_update_status("checking", "Update: checking...")
     thread = threading.Thread(target=_update_worker, daemon=True)
     thread.start()
@@ -1058,15 +1110,24 @@ class GOBSPPreferences(AddonPreferences):
     export_high_poly: BoolProperty(
         name="Export high poly if available",
         default=True,
+        update=_on_export_high_poly_update,
     )
     export_low_poly: BoolProperty(
         name="Export low poly",
         default=True,
+        update=_on_export_low_poly_update,
     )
     export_selected_only: BoolProperty(
         name="Export Selected Only",
         description="Limit low/high exports to the current selection",
         default=False,
+        update=_on_export_selected_only_update,
+    )
+    experimental_auto_split_selected: BoolProperty(
+        name="Experimental: Auto-split by Triangle Count",
+        description="Split selected meshes into low/high using triangle counts",
+        default=False,
+        update=_on_experimental_auto_split_update,
     )
     low_poly_suffixes: StringProperty(
         name="Low Poly Suffixes",
@@ -1082,11 +1143,6 @@ class GOBSPPreferences(AddonPreferences):
         name="High Poly Collection",
         description="Collection name to export as high poly",
         default="",
-    )
-    sp_auto_unwrap: BoolProperty(
-        name="Auto-unwrap (Blender)",
-        description="Generate UVs in Blender before export",
-        default=False,
     )
     fbx_export_scale: FloatProperty(
         name="FBX Export Scale",
@@ -1104,10 +1160,6 @@ class GOBSPPreferences(AddonPreferences):
     )
     ui_show_export_settings: BoolProperty(
         name="Show Export Settings",
-        default=True,
-    )
-    ui_show_sp_settings: BoolProperty(
-        name="Show Substance Settings",
         default=True,
     )
     ui_show_fbx_settings: BoolProperty(
@@ -1134,23 +1186,25 @@ class GOB_OT_SendToSP(Operator):
 
     def execute(self, context):
         prefs = get_prefs(context)
-        low_objects = collect_low_poly_objects(context, prefs)
-        high_candidates = []
-        if prefs and prefs.export_high_poly:
-            high_candidates = collect_high_poly_candidates(context, prefs)
-            if high_candidates and low_objects:
-                high_names = {obj.name for obj in high_candidates}
-                low_objects = [obj for obj in low_objects if obj.name not in high_names]
+        _enforce_selected_suffix_policy(context, prefs, operator=self)
+        if prefs and prefs.export_selected_only and prefs.experimental_auto_split_selected:
+            selected_meshes = [obj for obj in context.selected_objects if obj.type == "MESH"]
+            low_objects, high_candidates = split_meshes_by_triangles(selected_meshes)
+        else:
+            low_objects = collect_low_poly_objects(context, prefs)
+            high_candidates = []
+            if prefs and prefs.export_high_poly:
+                high_candidates = collect_high_poly_candidates(context, prefs)
+        if prefs and prefs.export_high_poly and high_candidates and low_objects:
+            high_names = {obj.name for obj in high_candidates}
+            low_objects = [obj for obj in low_objects if obj.name not in high_names]
         if not low_objects and (not prefs or prefs.export_low_poly):
             self.report({"ERROR"}, "Select or name at least one low poly mesh")
             return {"CANCELLED"}
 
-        auto_unwrap = bool(prefs and prefs.sp_auto_unwrap)
-
         if low_objects and any(not object_has_uvs(obj) for obj in low_objects):
-            if not auto_unwrap:
-                self.report({"ERROR"}, "Missing UVs: enable auto-unwrap or unwrap in Blender")
-                return {"CANCELLED"}
+            self.report({"ERROR"}, "Missing UVs: unwrap in Blender before export")
+            return {"CANCELLED"}
 
         active_info = find_active_sp_project_info(prefs)
         project_dir = active_info["project_dir"] if active_info else get_project_dir(context, prefs)
@@ -1165,13 +1219,11 @@ class GOB_OT_SendToSP(Operator):
                 self.report({"ERROR"}, "Low poly export enabled but no meshes found")
                 return {"CANCELLED"}
             strip_uvs = False
-            unwrap_uvs = auto_unwrap
             export_fbx_objects(
                 export_path,
                 low_objects,
                 prefs=prefs,
                 strip_uvs=strip_uvs,
-                unwrap_uvs=unwrap_uvs,
             )
         elif not old_mesh:
             self.report({"ERROR"}, "Low poly export disabled and no previous low mesh found")
@@ -1339,7 +1391,7 @@ class GOB_OT_CheckUpdates(Operator):
     bl_label = "Check for Updates"
 
     def execute(self, _context):
-        start_update_check(show_no_update=True)
+        start_update_check(show_no_update=True, show_popup=True)
         return {"FINISHED"}
 
 
@@ -1368,6 +1420,9 @@ class GOB_PT_Panel(Panel):
         row.operator(GOB_OT_SendToSP.bl_idname, icon="EXPORT")
         row.operator(GOB_OT_ImportFromSP.bl_idname, icon="IMPORT")
         layout.operator(GOB_OT_OpenExportFolder.bl_idname, icon="FILE_FOLDER")
+        if _last_export_warning:
+            warn_box = layout.box()
+            warn_box.label(text=_last_export_warning, icon="ERROR")
         update_box = layout.box()
         update_row = update_box.row(align=True)
         update_row.label(text=_update_status_text)
@@ -1384,27 +1439,24 @@ class GOB_PT_Panel(Panel):
                 col.prop(prefs, "export_selected_only")
                 col.prop(prefs, "export_low_poly")
                 col.prop(prefs, "export_high_poly")
+                col.prop(prefs, "experimental_auto_split_selected")
                 if prefs.export_high_poly:
-                    col.prop(prefs, "low_poly_suffixes")
-                    col.prop(prefs, "high_poly_suffixes")
-                    col.prop(prefs, "high_poly_collection_name")
                     info = export_box.box()
-                    info.label(text="Name meshes with your suffixes", icon="INFO")
-                    info.label(text=f"Low: ends with {prefs.low_poly_suffixes or '_low'}")
-                    info.label(text=f"High: ends with {prefs.high_poly_suffixes or '_high'}")
+                    if prefs.export_selected_only and prefs.experimental_auto_split_selected:
+                        info.label(text="Experimental: auto-split by triangle count", icon="INFO")
+                        info.label(text="Lower triangle meshes export as low")
+                        info.label(text="Higher triangle meshes export as high")
+                    else:
+                        col.prop(prefs, "low_poly_suffixes")
+                        col.prop(prefs, "high_poly_suffixes")
+                        col.prop(prefs, "high_poly_collection_name")
+                        info.label(text="Name meshes with your suffixes", icon="INFO")
+                        info.label(text=f"Low: ends with {prefs.low_poly_suffixes or '_low'}")
+                        info.label(text=f"High: ends with {prefs.high_poly_suffixes or '_high'}")
                 elif prefs.export_low_poly:
                     info = export_box.box()
                     info.label(text="Low poly must end with suffix (low-only too)", icon="INFO")
                     info.label(text=f"Low: ends with {prefs.low_poly_suffixes or '_low'}")
-
-            sp_box = layout.box()
-            row = sp_box.row()
-            icon = "TRIA_DOWN" if prefs.ui_show_sp_settings else "TRIA_RIGHT"
-            row.prop(prefs, "ui_show_sp_settings", icon=icon, emboss=False, text="Substance Painter")
-            if prefs.ui_show_sp_settings:
-                col = sp_box.column(align=True)
-                col.prop(prefs, "sp_auto_unwrap")
-                col.label(text="Auto-unwrap runs in Blender before export")
 
             fbx_box = layout.box()
             row = fbx_box.row()
@@ -1452,7 +1504,7 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    start_update_check()
+    start_update_check(show_popup=False)
 
 
 def unregister():
