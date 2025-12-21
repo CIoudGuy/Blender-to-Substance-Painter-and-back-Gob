@@ -2,6 +2,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -15,6 +16,7 @@ import substance_painter.event as sp_event
 
 BRIDGE_ENV_VAR = "GOB_SP_BRIDGE_DIR"
 BRIDGE_ROOT_HINT_FILENAME = "bridge_root.json"
+BRIDGE_SHARED_HINT_DIRNAME = ".gob_sp_bridge"
 MANIFEST_FILENAME = "bridge.json"
 BLENDER_EXPORT_FILENAME = "b2sp.fbx"
 SP_EXPORT_FILENAME = "sp2b.fbx"
@@ -201,21 +203,38 @@ def bridge_root_hint_path():
     return Path(default_bridge_dir()).expanduser() / BRIDGE_ROOT_HINT_FILENAME
 
 
+def shared_bridge_root_hint_path():
+    return Path.home() / BRIDGE_SHARED_HINT_DIRNAME / BRIDGE_ROOT_HINT_FILENAME
+
+
 def read_bridge_root_hint():
-    path = bridge_root_hint_path()
-    if not path.exists():
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    root = data.get("bridge_root")
-    if not root:
-        return None
-    return Path(root).expanduser()
+    for path in (bridge_root_hint_path(), shared_bridge_root_hint_path()):
+        if not path.exists():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        root = data.get("bridge_root")
+        if root:
+            return Path(root).expanduser()
+    return None
+
+
+def write_bridge_root_hint(root_path):
+    if not root_path:
+        return
+    payload = {"bridge_root": str(Path(root_path).expanduser())}
+    for path in (bridge_root_hint_path(), shared_bridge_root_hint_path()):
+        try:
+            ensure_dir(path.parent)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, ensure_ascii=True)
+        except OSError:
+            continue
 
 
 def settings_path():
@@ -362,6 +381,11 @@ def get_candidate_bridge_roots():
     if win_docs:
         roots.append(Path(win_docs) / "GoB_SP_Bridge")
     roots.append(Path.home() / "Documents" / "GoB_SP_Bridge")
+    if sys.platform == "darwin":
+        icloud_docs = (
+            Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "Documents"
+        )
+        roots.append(icloud_docs / "GoB_SP_Bridge")
     for var in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
         env = os.environ.get(var)
         if env:
@@ -1030,50 +1054,94 @@ def get_output_map_names(preset_info):
     return extract_output_map_names(get_output_map_definitions(preset_info))
 
 
-DOC_MAP_TO_CHANNEL = {
-    "basecolor": "BaseColor",
-    "base_color": "BaseColor",
-    "albedo": "BaseColor",
-    "diffuse": "BaseColor",
-    "roughness": "Roughness",
-    "glossiness": "Glossiness",
-    "metallic": "Metallic",
-    "metalness": "Metallic",
-    "normal": "Normal",
-    "height": "Height",
-    "displacement": "Height",
-    "opacity": "Opacity",
-    "emissive": "Emissive",
-    "emission": "Emissive",
-    "specular": "Specular",
-    "specularlevel": "SpecularLevel",
+DOC_MAP_TO_CHANNELS = {
+    "basecolor": ["BaseColor", "Diffuse", "Color"],
+    "base_color": ["BaseColor", "Diffuse", "Color"],
+    "albedo": ["BaseColor", "Diffuse", "Color"],
+    "diffuse": ["Diffuse", "BaseColor", "Color"],
+    "color": ["Color", "BaseColor", "Diffuse"],
+    "roughness": ["Roughness"],
+    "glossiness": ["Glossiness"],
+    "metallic": ["Metallic"],
+    "metalness": ["Metallic"],
+    "normal": ["Normal"],
+    "height": ["Height"],
+    "displacement": ["Height"],
+    "opacity": ["Opacity"],
+    "alpha": ["Opacity"],
+    "emissive": ["Emissive"],
+    "emission": ["Emissive"],
+    "specular": ["Specular", "SpecularLevel"],
+    "specularlevel": ["SpecularLevel", "Specular"],
+    "ao": ["AmbientOcclusion", "Occlusion", "AO"],
+    "ambientocclusion": ["AmbientOcclusion", "Occlusion", "AO"],
+    "occlusion": ["Occlusion", "AmbientOcclusion", "AO"],
+    "user0": ["User0"],
+    "user1": ["User1"],
+    "user2": ["User2"],
+    "user3": ["User3"],
+    "blendingmask": ["BlendingMask"],
+    "blending mask": ["BlendingMask"],
 }
 
 
 def stack_has_doc_map(stack, doc_map_name):
     if not doc_map_name:
         return True
-    lookup = DOC_MAP_TO_CHANNEL.get(doc_map_name.lower())
+    lookup = DOC_MAP_TO_CHANNELS.get(doc_map_name.lower())
     if not lookup:
         return True
-    channel_type = sp.textureset.ChannelType.__members__.get(lookup)
-    if not channel_type:
-        return True
-    return stack.has_channel(channel_type)
+    found_type = False
+    for channel_name in lookup:
+        channel_type = sp.textureset.ChannelType.__members__.get(channel_name)
+        if not channel_type:
+            continue
+        found_type = True
+        if stack.has_channel(channel_type):
+            return True
+    return not found_type
 
 
-def get_required_doc_maps(map_def):
-    required = set()
+def get_required_map_groups(map_def):
+    required_doc = set()
+    required_input = set()
     if not isinstance(map_def, dict):
-        return required
+        return required_doc, required_input
     channels = map_def.get("channels") or []
     for channel in channels:
-        if channel.get("srcMapType") != "documentMap":
-            continue
+        src_type = channel.get("srcMapType")
         name = channel.get("srcMapName")
-        if name:
-            required.add(name.lower())
-    return required
+        if not name:
+            continue
+        if src_type == "documentMap":
+            required_doc.add(name.lower())
+        elif src_type == "inputMap":
+            required_input.add(name.lower())
+    return required_doc, required_input
+
+
+def infer_normal_map_format_from_preset(preset_info):
+    if not preset_info:
+        return None
+    name = str(preset_info.get("name") or "").lower()
+    if "directx" in name or "d3d" in name:
+        return "directx"
+    if "opengl" in name or "ogl" in name:
+        return "opengl"
+    map_defs = get_output_map_definitions(preset_info)
+    for map_def in map_defs:
+        if not isinstance(map_def, dict):
+            continue
+        channels = map_def.get("channels") or []
+        for channel in channels:
+            if channel.get("srcMapType") != "virtualMap":
+                continue
+            src_name = str(channel.get("srcMapName") or "").lower()
+            if "directx" in src_name or "d3d" in src_name:
+                return "directx"
+            if "opengl" in src_name or "ogl" in src_name:
+                return "opengl"
+    return None
 
 
 def build_export_list_for_preset(preset_info, selected_output_maps, selected_texture_sets=None):
@@ -1098,14 +1166,19 @@ def build_export_list_for_preset(preset_info, selected_output_maps, selected_tex
             if stack.name():
                 root = f"{root}/{stack.name()}"
             valid_maps = []
+            had_channel_info = False
             for map_def in map_defs:
                 if isinstance(map_def, dict):
                     map_name = map_def.get("fileName")
                     if not map_name or map_name not in selected_output_maps:
                         continue
-                    required = get_required_doc_maps(map_def)
-                    missing = [req for req in required if not stack_has_doc_map(stack, req)]
-                    if missing:
+                    if map_def.get("channels"):
+                        had_channel_info = True
+                    required_doc, required_input = get_required_map_groups(map_def)
+                    missing_input = [
+                        req for req in required_input if not stack_has_doc_map(stack, req)
+                    ]
+                    if missing_input:
                         continue
                     valid_maps.append(map_name)
                 elif isinstance(map_def, str):
@@ -1115,7 +1188,7 @@ def build_export_list_for_preset(preset_info, selected_output_maps, selected_tex
                     map_name = getattr(map_def, "fileName", None) or getattr(map_def, "file_name", None)
                     if map_name and map_name in selected_output_maps:
                         valid_maps.append(map_name)
-            if not valid_maps and selected_output_maps:
+            if not valid_maps and selected_output_maps and not had_channel_info:
                 valid_maps = list(selected_output_maps)
             if not valid_maps:
                 continue
@@ -1638,7 +1711,7 @@ class ExportDialog(QtWidgets.QDialog):
         maps_layout.addLayout(map_toolbar)
         self.map_list = QtWidgets.QListWidget()
         self.map_list.setMinimumHeight(240)
-        self.map_list.setAlternatingRowColors(True)
+        self.map_list.setAlternatingRowColors(False)
         self.map_list.setUniformItemSizes(True)
         self.map_list.itemChanged.connect(self._update_map_count)
         maps_layout.addWidget(self.map_list)
@@ -2250,6 +2323,7 @@ def send_to_blender():
     dialog.persist_last_settings(options)
 
     project_dir = get_project_dir()
+    write_bridge_root_hint(project_dir.parent)
     ensure_dir(project_dir)
 
     manifest = {
@@ -2275,6 +2349,9 @@ def send_to_blender():
         if not preset:
             texture_errors.append("No export preset found.")
         else:
+            normal_format = infer_normal_map_format_from_preset(preset)
+            if normal_format:
+                manifest["normal_map_format"] = normal_format
             textures_dir = project_dir / "textures"
             if textures_dir.exists():
                 try:
@@ -2341,7 +2418,13 @@ def send_to_blender():
                             continue
                         textures = []
                         for _key, files in export_result.textures.items():
-                            textures.extend(files)
+                            for file in files:
+                                if not file:
+                                    continue
+                                path = Path(file)
+                                if not path.is_absolute():
+                                    path = textures_dir / path
+                                textures.append(str(path))
                         manifest["textures_dir"] = str(textures_dir)
                         manifest["textures"] = textures
                         exported_any = True
@@ -2393,7 +2476,6 @@ def start_plugin():
             _ui_elements.append(quick_element)
     except Exception:
         pass
-    start_update_check()
     write_active_sp_info()
     def _auto_import_poll():
         global _auto_import_last_time

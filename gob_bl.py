@@ -27,6 +27,7 @@ from bpy.types import AddonPreferences, Operator, Panel
 
 BRIDGE_ENV_VAR = "GOB_SP_BRIDGE_DIR"
 BRIDGE_ROOT_HINT_FILENAME = "bridge_root.json"
+BRIDGE_SHARED_HINT_DIRNAME = ".gob_sp_bridge"
 MANIFEST_FILENAME = "bridge.json"
 BLENDER_EXPORT_FILENAME = "b2sp.fbx"
 BLENDER_HIGH_FILENAME = "b2sp_hi.fbx"
@@ -170,21 +171,41 @@ def bridge_root_hint_path():
     return Path(default_bridge_dir()) / BRIDGE_ROOT_HINT_FILENAME
 
 
+def shared_bridge_root_hint_path():
+    return Path.home() / BRIDGE_SHARED_HINT_DIRNAME / BRIDGE_ROOT_HINT_FILENAME
+
+
+def read_bridge_root_hint(path):
+    if not path:
+        return None
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    root = data.get("bridge_root")
+    if not root:
+        return None
+    return Path(root).expanduser()
+
+
 def write_bridge_root_hint(root_path):
     if not root_path:
         return
-    hint_path = bridge_root_hint_path()
-    try:
-        ensure_dir(hint_path.parent)
-        with open(hint_path, "w", encoding="utf-8") as handle:
-            json.dump(
-                {"bridge_root": str(Path(root_path).expanduser())},
-                handle,
-                indent=2,
-                ensure_ascii=True,
-            )
-    except OSError:
-        return
+    hint_paths = [bridge_root_hint_path(), shared_bridge_root_hint_path()]
+    payload = {"bridge_root": str(Path(root_path).expanduser())}
+    for hint_path in hint_paths:
+        try:
+            ensure_dir(hint_path.parent)
+            with open(hint_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, ensure_ascii=True)
+        except OSError:
+            continue
 
 
 
@@ -263,10 +284,21 @@ def get_candidate_bridge_roots(prefs):
         roots.append(Path(env_path))
     if prefs and prefs.bridge_dir:
         roots.append(Path(prefs.bridge_dir))
+    hint = read_bridge_root_hint(bridge_root_hint_path())
+    if hint:
+        roots.append(hint)
+    shared_hint = read_bridge_root_hint(shared_bridge_root_hint_path())
+    if shared_hint:
+        roots.append(shared_hint)
     docs = windows_documents_dir()
     if docs:
         roots.append(Path(docs) / "GoB_SP_Bridge")
     roots.append(Path.home() / "Documents" / "GoB_SP_Bridge")
+    if sys.platform == "darwin":
+        icloud_docs = (
+            Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "Documents"
+        )
+        roots.append(icloud_docs / "GoB_SP_Bridge")
     for var in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
         env = os.environ.get(var)
         if env:
@@ -385,32 +417,59 @@ def detect_map_type(stem_lower):
     for keyword, map_type in MAP_KEYWORDS:
         if keyword in stem_lower:
             return map_type, keyword
+    if "rgb" in stem_lower:
+        return "base_color", "rgb"
     return None, None
 
 
+def should_invert_normal_y(path, manifest=None):
+    if manifest:
+        fmt = manifest.get("normal_map_format") or manifest.get("normal_format")
+        if fmt:
+            fmt_lower = str(fmt).lower()
+            if "directx" in fmt_lower or "d3d" in fmt_lower or fmt_lower == "dx":
+                return True
+            if "opengl" in fmt_lower or "ogl" in fmt_lower or fmt_lower == "gl":
+                return False
+        if "normal_map_y_invert" in manifest:
+            return bool(manifest.get("normal_map_y_invert"))
+    name = Path(path).stem.lower()
+    if "directx" in name or "d3d" in name or "_dx" in name or name.endswith("dx"):
+        return True
+    if "opengl" in name or "ogl" in name or "_gl" in name or name.endswith("gl"):
+        return False
+    return False
 
 
-def guess_texture_set_name(stem, keyword):
+
+def guess_texture_set_name(stem, keyword, fallback=None):
     if not keyword:
         return stem
     lower = stem.lower()
     idx = lower.find(keyword)
     if idx <= 0:
-        return stem
+        return fallback or stem
     base = stem[:idx].rstrip(" _-.")
-    return base or stem
+    return base or fallback or stem
 
 
 def gather_texture_paths(manifest):
     paths = []
     if not manifest:
         return paths
-    if isinstance(manifest.get("textures"), list):
-        paths.extend(manifest["textures"])
     textures_dir = manifest.get("textures_dir")
-    if textures_dir:
+    base_dir = Path(textures_dir).expanduser() if textures_dir else None
+    if isinstance(manifest.get("textures"), list):
+        for raw in manifest["textures"]:
+            if not raw:
+                continue
+            path = Path(raw).expanduser()
+            if not path.is_absolute() and base_dir:
+                path = base_dir / path
+            paths.append(str(path))
+    if base_dir:
         for ext in IMAGE_EXTS:
-            for path in Path(textures_dir).glob(f"*{ext}"):
+            for path in base_dir.rglob(f"*{ext}"):
                 if path.is_file():
                     paths.append(str(path))
     seen = set()
@@ -426,11 +485,18 @@ def gather_texture_paths(manifest):
 def group_textures(texture_paths):
     grouped = {}
     for path in texture_paths:
-        stem = Path(path).stem
+        path_obj = Path(path)
+        stem = path_obj.stem
         map_type, keyword = detect_map_type(stem.lower())
         if not map_type:
             continue
-        texset = guess_texture_set_name(stem, keyword)
+        fallback = None
+        lower_parts = [part.lower() for part in path_obj.parts]
+        if "textures" in lower_parts:
+            idx = len(lower_parts) - 1 - lower_parts[::-1].index("textures")
+            if idx + 1 < len(path_obj.parts):
+                fallback = path_obj.parts[idx + 1]
+        texset = guess_texture_set_name(stem, keyword, fallback=fallback)
         grouped.setdefault(texset, {})[map_type] = path
     return grouped
 
@@ -447,7 +513,7 @@ def load_image(path):
     return image
 
 
-def build_material(mat, maps):
+def build_material(mat, maps, normal_y_invert=False):
     mat["gob_bridge_material"] = True
     mat.use_nodes = True
     nodes = mat.node_tree.nodes
@@ -532,7 +598,21 @@ def build_material(mat, maps):
     if normal_node:
         normal_map = nodes.new("ShaderNodeNormalMap")
         normal_map.location = (-50, -520)
-        links.new(normal_node.outputs["Color"], normal_map.inputs["Color"])
+        if normal_y_invert:
+            separate = nodes.new("ShaderNodeSeparateRGB")
+            separate.location = (-250, -520)
+            invert = nodes.new("ShaderNodeInvert")
+            invert.location = (-200, -640)
+            combine = nodes.new("ShaderNodeCombineRGB")
+            combine.location = (-100, -520)
+            links.new(normal_node.outputs["Color"], separate.inputs["Image"])
+            links.new(separate.outputs["R"], combine.inputs["R"])
+            links.new(separate.outputs["G"], invert.inputs["Color"])
+            links.new(invert.outputs["Color"], combine.inputs["G"])
+            links.new(separate.outputs["B"], combine.inputs["B"])
+            links.new(combine.outputs["Image"], normal_map.inputs["Color"])
+        else:
+            links.new(normal_node.outputs["Color"], normal_map.inputs["Color"])
         links.new(normal_map.outputs["Normal"], principled.inputs["Normal"])
 
     if height_node:
@@ -553,13 +633,13 @@ def build_material(mat, maps):
     return mat
 
 
-def get_or_build_material(name, maps):
+def get_or_build_material(name, maps, normal_y_invert=False):
     mat = bpy.data.materials.get(name)
     if mat and not mat.get("gob_bridge_material"):
         mat = None
     if not mat:
         mat = bpy.data.materials.new(name=name)
-    return build_material(mat, maps)
+    return build_material(mat, maps, normal_y_invert=normal_y_invert)
 
 
 def assign_material_to_object(obj, material, texset_name, all_groups):
@@ -583,13 +663,43 @@ def assign_material_to_object(obj, material, texset_name, all_groups):
     obj.data.materials[target_slot] = material
 
 
-def apply_textures_to_objects(objects, grouped):
+def find_texture_targets(context, grouped):
+    if not grouped:
+        return []
+    keys = {key.lower() for key in grouped if key}
+    matches = []
+    for obj in context.scene.objects:
+        if obj.type != "MESH":
+            continue
+        matched = False
+        for slot in obj.material_slots:
+            if slot.material and slot.material.name.lower() in keys:
+                matched = True
+                break
+        if not matched:
+            lname = obj.name.lower()
+            if any(key in lname for key in keys):
+                matched = True
+        if matched:
+            matches.append(obj)
+    if matches:
+        return matches
+    if len(keys) == 1:
+        if context.active_object and context.active_object.type == "MESH":
+            return [context.active_object]
+        return [obj for obj in context.scene.objects if obj.type == "MESH"]
+    return []
+
+
+def apply_textures_to_objects(objects, grouped, manifest=None):
     if not grouped:
         return
     materials = {}
     for texset, maps in grouped.items():
         mat_name = texset
-        mat = get_or_build_material(mat_name, maps)
+        normal_path = maps.get("normal")
+        normal_y_invert = bool(normal_path and should_invert_normal_y(normal_path, manifest=manifest))
+        mat = get_or_build_material(mat_name, maps, normal_y_invert=normal_y_invert)
         materials[texset.lower()] = mat
 
     groups = list(materials.items())
@@ -1359,11 +1469,18 @@ class GOB_OT_ImportFromSP(Operator):
 
         texture_paths = gather_texture_paths(manifest)
         targets = new_objects
+        grouped = group_textures(texture_paths) if texture_paths else {}
         if not targets:
             targets = [obj for obj in context.selected_objects if obj.type == "MESH"]
+        if not targets and grouped:
+            targets = find_texture_targets(context, grouped)
+            if not targets:
+                self.report(
+                    {"WARNING"},
+                    "No mesh targets found; select meshes or match material names to texture sets",
+                )
         if texture_paths and targets:
-            grouped = group_textures(texture_paths)
-            apply_textures_to_objects(targets, grouped)
+            apply_textures_to_objects(targets, grouped, manifest=manifest)
 
         self.report({"INFO"}, "Imported assets from Substance Painter")
         return {"FINISHED"}
