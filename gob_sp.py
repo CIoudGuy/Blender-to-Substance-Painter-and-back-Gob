@@ -28,7 +28,7 @@ UPDATE_URL = (
     "https://raw.githubusercontent.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/"
     "refs/heads/main/version.json"
 )
-PLUGIN_VERSION = "0.1.5"
+PLUGIN_VERSION = "0.1.6"
 
 EXPORT_FORMATS = [
     ("png", "PNG"),

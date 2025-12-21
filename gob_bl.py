@@ -1,7 +1,7 @@
 bl_info = {
     "name": "GoB SP Bridge",
     "author": "Cloud Guy | cloud_was_taken on Discord",
-    "version": (0, 1, 5),
+    "version": (0, 1, 6),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > GoB SP",
     "description": "Send FBX to Substance 3D Painter and import meshes/textures back",
