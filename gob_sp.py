@@ -14,6 +14,7 @@ import substance_painter.event as sp_event
 
 
 BRIDGE_ENV_VAR = "GOB_SP_BRIDGE_DIR"
+BRIDGE_ROOT_HINT_FILENAME = "bridge_root.json"
 MANIFEST_FILENAME = "bridge.json"
 BLENDER_EXPORT_FILENAME = "b2sp.fbx"
 SP_EXPORT_FILENAME = "sp2b.fbx"
@@ -25,7 +26,7 @@ UPDATE_URL = (
     "https://raw.githubusercontent.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/"
     "refs/heads/main/version.json"
 )
-PLUGIN_VERSION = "0.1.4"
+PLUGIN_VERSION = "0.1.5"
 
 EXPORT_FORMATS = [
     ("png", "PNG"),
@@ -196,6 +197,27 @@ def default_bridge_dir():
     return os.path.join(os.path.expanduser("~"), "Documents", "GoB_SP_Bridge")
 
 
+def bridge_root_hint_path():
+    return Path(default_bridge_dir()).expanduser() / BRIDGE_ROOT_HINT_FILENAME
+
+
+def read_bridge_root_hint():
+    path = bridge_root_hint_path()
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    root = data.get("bridge_root")
+    if not root:
+        return None
+    return Path(root).expanduser()
+
+
 def settings_path():
     base = QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.AppDataLocation)
     if not base:
@@ -260,6 +282,12 @@ def sanitize_name(name):
 
 
 def get_bridge_root():
+    env_path = os.environ.get(BRIDGE_ENV_VAR)
+    if env_path:
+        return Path(env_path).expanduser()
+    hint = read_bridge_root_hint()
+    if hint:
+        return hint
     return Path(default_bridge_dir()).expanduser()
 
 
@@ -324,6 +352,9 @@ def get_candidate_bridge_roots():
     env_path = os.environ.get(BRIDGE_ENV_VAR)
     if env_path:
         roots.append(Path(env_path))
+    hint = read_bridge_root_hint()
+    if hint:
+        roots.append(hint)
     docs = QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.DocumentsLocation)
     if docs:
         roots.append(Path(docs) / "GoB_SP_Bridge")

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "GoB SP Bridge",
     "author": "Cloud Guy | cloud_was_taken on Discord",
-    "version": (0, 1, 4),
+    "version": (0, 1, 5),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > GoB SP",
     "description": "Send FBX to Substance 3D Painter and import meshes/textures back",
@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -25,6 +26,7 @@ from bpy.types import AddonPreferences, Operator, Panel
 
 
 BRIDGE_ENV_VAR = "GOB_SP_BRIDGE_DIR"
+BRIDGE_ROOT_HINT_FILENAME = "bridge_root.json"
 MANIFEST_FILENAME = "bridge.json"
 BLENDER_EXPORT_FILENAME = "b2sp.fbx"
 BLENDER_HIGH_FILENAME = "b2sp_hi.fbx"
@@ -162,6 +164,27 @@ def get_project_name(context):
 
 def get_project_dir(context, prefs):
     return get_bridge_root(prefs) / get_project_name(context)
+
+
+def bridge_root_hint_path():
+    return Path(default_bridge_dir()) / BRIDGE_ROOT_HINT_FILENAME
+
+
+def write_bridge_root_hint(root_path):
+    if not root_path:
+        return
+    hint_path = bridge_root_hint_path()
+    try:
+        ensure_dir(hint_path.parent)
+        with open(hint_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"bridge_root": str(Path(root_path).expanduser())},
+                handle,
+                indent=2,
+                ensure_ascii=True,
+            )
+    except OSError:
+        return
 
 
 
@@ -414,9 +437,14 @@ def group_textures(texture_paths):
 
 def load_image(path):
     try:
-        return bpy.data.images.load(path, check_existing=True)
+        image = bpy.data.images.load(path, check_existing=True)
     except RuntimeError:
         return None
+    try:
+        image.reload()
+    except RuntimeError:
+        pass
+    return image
 
 
 def build_material(mat, maps):
@@ -814,34 +842,62 @@ def import_fbx(filepath):
 def find_sp_exe(_prefs):
     for env_var in ("SUBSTANCE_PAINTER_EXE", "ADOBE_SUBSTANCE_PAINTER_EXE"):
         env_path = os.environ.get(env_var)
-        if env_path and Path(env_path).is_file():
-            return env_path
+        if env_path:
+            env_candidate = Path(env_path).expanduser()
+            if env_candidate.is_file():
+                return str(env_candidate)
+            if sys.platform == "darwin" and env_candidate.suffix.lower() == ".app" and env_candidate.is_dir():
+                return str(env_candidate)
 
-    program_files = os.environ.get("ProgramFiles", r"C:\\Program Files")
-    program_files_x86 = os.environ.get("ProgramFiles(x86)")
-    candidates = [
-        Path(program_files) / "Adobe" / "Adobe Substance 3D Painter" / "Adobe Substance 3D Painter.exe",
-        Path(program_files) / "Adobe" / "Adobe Substance 3D Painter" / "Substance 3D Painter.exe",
-        Path(program_files) / "Adobe" / "Substance 3D Painter" / "Substance 3D Painter.exe",
-        Path(program_files) / "Adobe" / "Substance 3D Painter 11.1.1" / "Substance 3D Painter.exe",
-        Path(program_files) / "Allegorithmic" / "Substance Painter" / "Substance Painter.exe",
-    ]
-    if program_files_x86:
-        candidates.extend([
-            Path(program_files_x86) / "Adobe" / "Adobe Substance 3D Painter" / "Adobe Substance 3D Painter.exe",
-            Path(program_files_x86) / "Adobe" / "Substance 3D Painter" / "Substance 3D Painter.exe",
-        ])
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
+    if os.name == "nt":
+        program_files = os.environ.get("ProgramFiles", r"C:\\Program Files")
+        program_files_x86 = os.environ.get("ProgramFiles(x86)")
+        candidates = [
+            Path(program_files) / "Adobe" / "Adobe Substance 3D Painter" / "Adobe Substance 3D Painter.exe",
+            Path(program_files) / "Adobe" / "Adobe Substance 3D Painter" / "Substance 3D Painter.exe",
+            Path(program_files) / "Adobe" / "Substance 3D Painter" / "Substance 3D Painter.exe",
+            Path(program_files) / "Adobe" / "Substance 3D Painter 11.1.1" / "Substance 3D Painter.exe",
+            Path(program_files) / "Allegorithmic" / "Substance Painter" / "Substance Painter.exe",
+        ]
+        if program_files_x86:
+            candidates.extend([
+                Path(program_files_x86) / "Adobe" / "Adobe Substance 3D Painter" / "Adobe Substance 3D Painter.exe",
+                Path(program_files_x86) / "Adobe" / "Substance 3D Painter" / "Substance 3D Painter.exe",
+            ])
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
 
-    for base in filter(None, [Path(program_files) / "Adobe", Path(program_files_x86) / "Adobe"]):
-        if not base.exists():
-            continue
-        for exe in base.rglob("*Painter*.exe"):
-            name = exe.name.lower()
-            if "painter" in name and "substance" in name:
-                return str(exe)
+        adobe_bases = []
+        for base in (program_files, program_files_x86):
+            if base:
+                adobe_bases.append(Path(base) / "Adobe")
+        for base in adobe_bases:
+            if not base.exists():
+                continue
+            for exe in base.rglob("*Painter*.exe"):
+                name = exe.name.lower()
+                if "painter" in name and "substance" in name:
+                    return str(exe)
+    elif sys.platform == "darwin":
+        app_candidates = [
+            Path("/Applications/Adobe Substance 3D Painter.app"),
+            Path("/Applications/Substance 3D Painter.app"),
+            Path("/Applications/Allegorithmic/Substance Painter.app"),
+            Path.home() / "Applications" / "Adobe Substance 3D Painter.app",
+            Path.home() / "Applications" / "Substance 3D Painter.app",
+            Path.home() / "Applications" / "Substance Painter.app",
+        ]
+        for candidate in app_candidates:
+            if candidate.is_dir():
+                return str(candidate)
+        for root in (Path("/Applications"), Path.home() / "Applications"):
+            if not root.exists():
+                continue
+            for app in root.glob("*.app"):
+                name = app.name.lower()
+                if "painter" in name and "substance" in name:
+                    return str(app)
     return None
 
 
@@ -1208,6 +1264,7 @@ class GOB_OT_SendToSP(Operator):
 
         active_info = find_active_sp_project_info(prefs)
         project_dir = active_info["project_dir"] if active_info else get_project_dir(context, prefs)
+        write_bridge_root_hint(project_dir.parent)
         ensure_dir(project_dir)
 
         export_path = project_dir / BLENDER_EXPORT_FILENAME
@@ -1258,7 +1315,10 @@ class GOB_OT_SendToSP(Operator):
             sp_exe = find_sp_exe(prefs)
             if sp_exe and not sp_running:
                 try:
-                    subprocess.Popen([sp_exe])
+                    if sys.platform == "darwin" and sp_exe.lower().endswith(".app"):
+                        subprocess.Popen(["open", "-a", sp_exe])
+                    else:
+                        subprocess.Popen([sp_exe])
                 except OSError:
                     self.report({"WARNING"}, "Failed to launch Substance Painter")
             elif not sp_exe:
