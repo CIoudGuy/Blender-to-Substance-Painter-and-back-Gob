@@ -1,7 +1,7 @@
 bl_info = {
     "name": "GoB SP Bridge",
     "author": "Cloud Guy | cloud_was_taken on Discord",
-    "version": (0, 1, 6),
+    "version": (0, 1, 7),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > GoB SP",
     "description": "Send FBX to Substance 3D Painter and import meshes/textures back",
@@ -39,16 +39,22 @@ UPDATE_URL = (
 )
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".tga", ".exr"}
+CACHE_WARN_BYTES = 35 * 1024 ** 3
 
 MAP_KEYWORDS = [
     ("basecolor", "base_color"),
     ("base_color", "base_color"),
+    ("basec", "base_color"),
+    ("basecol", "base_color"),
+    ("base_map", "base_color"),
+    ("basemap", "base_color"),
     ("albedo", "base_color"),
     ("diffuse", "base_color"),
     ("metallic", "metallic"),
     ("metalness", "metallic"),
     ("roughness", "roughness"),
     ("glossiness", "glossiness"),
+    ("specular", "specular"),
     ("normal", "normal"),
     ("ambientocclusion", "ao"),
     ("occlusion", "ao"),
@@ -414,6 +420,42 @@ def check_for_updates():
 
 
 def detect_map_type(stem_lower):
+    if "occlusionroughnessmetallic" in stem_lower:
+        return "orm", "occlusionroughnessmetallic"
+    if "occlusionroughnessmetal" in stem_lower:
+        return "orm", "occlusionroughnessmetal"
+    match = re.search(r"occlusion[._\\-]?roughness[._\\-]?metallic", stem_lower)
+    if match:
+        return "orm", match.group(0)
+    match = re.search(r"occlusion[._\\-]?roughness[._\\-]?metal", stem_lower)
+    if match:
+        return "orm", match.group(0)
+    match = re.search(r"(?:^|[._\\-])arm(?:$|[._\\-])", stem_lower)
+    if match:
+        return "orm", match.group(0)
+    match = re.search(r"(?:^|[._\\-])orm(?:$|[._\\-])", stem_lower)
+    if match:
+        return "orm", match.group(0)
+    match = re.search(r"metallic[._\\-]?roughness", stem_lower)
+    if match:
+        return "metallic_roughness", match.group(0)
+    match = re.search(r"roughness[._\\-]?metallic", stem_lower)
+    if match:
+        return "metallic_roughness", match.group(0)
+    match = re.search(r"metallic[._\\-]?smoothness", stem_lower)
+    if match:
+        return "metallic_smoothness", match.group(0)
+    match = re.search(r"specular[._\\-]?smoothness", stem_lower)
+    if match:
+        return "specular_smoothness", match.group(0)
+    match = re.search(r"specular[._\\-]?gloss", stem_lower)
+    if match:
+        return "specular_smoothness", match.group(0)
+    if re.search(r"specgloss", stem_lower):
+        return "specular_smoothness", "specgloss"
+    match = re.search(r"mask[._\\-]?map", stem_lower)
+    if match:
+        return "mask", match.group(0)
     for keyword, map_type in MAP_KEYWORDS:
         if keyword in stem_lower:
             return map_type, keyword
@@ -535,11 +577,19 @@ def build_material(mat, maps, normal_y_invert=False):
     opacity_node = None
     metallic_node = None
     roughness_node = None
+    orm_node = None
+    mask_node = None
+    metallic_roughness_node = None
+    metallic_smoothness_node = None
+    specular_node = None
+    specular_smoothness_node = None
 
     y = 300
     step = -220
-    for map_type in ("base_color", "ao", "metallic", "roughness", "glossiness",
-                     "normal", "height", "opacity", "emission"):
+    for map_type in ("base_color", "orm", "metallic_roughness", "metallic_smoothness",
+                     "mask", "ao", "metallic", "roughness", "glossiness",
+                     "specular_smoothness", "specular", "normal", "height",
+                     "opacity", "emission"):
         if map_type not in maps:
             continue
         tex = nodes.new("ShaderNodeTexImage")
@@ -549,13 +599,24 @@ def build_material(mat, maps, normal_y_invert=False):
         if not image:
             continue
         tex.image = image
-        if map_type in {"normal", "roughness", "metallic", "ao", "height", "opacity", "glossiness"}:
+        if map_type in {"normal", "roughness", "metallic", "ao", "height",
+                        "opacity", "glossiness", "orm", "metallic_roughness",
+                        "metallic_smoothness", "mask", "specular_smoothness",
+                        "specular"}:
             try:
                 image.colorspace_settings.name = "Non-Color"
             except TypeError:
                 pass
         if map_type == "base_color":
             base_node = tex
+        elif map_type == "orm":
+            orm_node = tex
+        elif map_type == "metallic_roughness":
+            metallic_roughness_node = tex
+        elif map_type == "metallic_smoothness":
+            metallic_smoothness_node = tex
+        elif map_type == "mask":
+            mask_node = tex
         elif map_type == "ao":
             ao_node = tex
         elif map_type == "metallic":
@@ -564,6 +625,10 @@ def build_material(mat, maps, normal_y_invert=False):
             roughness_node = tex
         elif map_type == "glossiness":
             gloss_node = tex
+        elif map_type == "specular_smoothness":
+            specular_smoothness_node = tex
+        elif map_type == "specular":
+            specular_node = tex
         elif map_type == "normal":
             normal_node = tex
         elif map_type == "height":
@@ -573,27 +638,100 @@ def build_material(mat, maps, normal_y_invert=False):
         elif map_type == "emission":
             emission_node = tex
 
-    if base_node and ao_node:
+    ao_output = ao_node.outputs["Color"] if ao_node else None
+    metallic_output = metallic_node.outputs["Color"] if metallic_node else None
+    roughness_output = roughness_node.outputs["Color"] if roughness_node else None
+    specular_output = specular_node.outputs["Color"] if specular_node else None
+    if orm_node:
+        separate = nodes.new("ShaderNodeSeparateRGB")
+        separate.location = (-220, -300)
+        links.new(orm_node.outputs["Color"], separate.inputs["Image"])
+        if ao_output is None:
+            ao_output = separate.outputs["R"]
+        if roughness_output is None:
+            roughness_output = separate.outputs["G"]
+        if metallic_output is None:
+            metallic_output = separate.outputs["B"]
+    if metallic_roughness_node:
+        separate = nodes.new("ShaderNodeSeparateRGB")
+        separate.location = (-220, -120)
+        links.new(metallic_roughness_node.outputs["Color"], separate.inputs["Image"])
+        if roughness_output is None:
+            roughness_output = separate.outputs["G"]
+        if metallic_output is None:
+            metallic_output = separate.outputs["B"]
+    if metallic_smoothness_node:
+        separate = nodes.new("ShaderNodeSeparateRGB")
+        separate.location = (-220, -180)
+        links.new(metallic_smoothness_node.outputs["Color"], separate.inputs["Image"])
+        if metallic_output is None:
+            metallic_output = separate.outputs["R"]
+        if roughness_output is None:
+            invert = nodes.new("ShaderNodeInvert")
+            invert.inputs["Fac"].default_value = 1.0
+            invert.location = (-120, -200)
+            links.new(metallic_smoothness_node.outputs["Alpha"], invert.inputs["Color"])
+            roughness_output = invert.outputs["Color"]
+    if mask_node:
+        separate = nodes.new("ShaderNodeSeparateRGB")
+        separate.location = (-220, -240)
+        links.new(mask_node.outputs["Color"], separate.inputs["Image"])
+        if metallic_output is None:
+            metallic_output = separate.outputs["R"]
+        if ao_output is None:
+            ao_output = separate.outputs["G"]
+        if roughness_output is None:
+            invert = nodes.new("ShaderNodeInvert")
+            invert.inputs["Fac"].default_value = 1.0
+            invert.location = (-120, -260)
+            links.new(mask_node.outputs["Alpha"], invert.inputs["Color"])
+            roughness_output = invert.outputs["Color"]
+    if specular_smoothness_node:
+        if specular_output is None:
+            specular_output = specular_smoothness_node.outputs["Color"]
+        if roughness_output is None:
+            invert = nodes.new("ShaderNodeInvert")
+            invert.inputs["Fac"].default_value = 1.0
+            invert.location = (-120, -320)
+            links.new(specular_smoothness_node.outputs["Alpha"], invert.inputs["Color"])
+            roughness_output = invert.outputs["Color"]
+
+    if base_node and ao_output:
         mix = nodes.new("ShaderNodeMixRGB")
         mix.blend_type = "MULTIPLY"
         mix.inputs["Fac"].default_value = 1.0
         mix.location = (-50, 200)
         links.new(base_node.outputs["Color"], mix.inputs["Color1"])
-        links.new(ao_node.outputs["Color"], mix.inputs["Color2"])
+        links.new(ao_output, mix.inputs["Color2"])
         links.new(mix.outputs["Color"], principled.inputs["Base Color"])
     elif base_node:
         links.new(base_node.outputs["Color"], principled.inputs["Base Color"])
 
-    if metallic_node:
-        links.new(metallic_node.outputs["Color"], principled.inputs["Metallic"])
+    if metallic_output:
+        links.new(metallic_output, principled.inputs["Metallic"])
 
-    if roughness_node:
-        links.new(roughness_node.outputs["Color"], principled.inputs["Roughness"])
+    if roughness_output:
+        links.new(roughness_output, principled.inputs["Roughness"])
     elif gloss_node:
         invert = nodes.new("ShaderNodeInvert")
         invert.location = (-100, -260)
         links.new(gloss_node.outputs["Color"], invert.inputs["Color"])
         links.new(invert.outputs["Color"], principled.inputs["Roughness"])
+
+    if specular_output:
+        specular_input = None
+        for socket in principled.inputs:
+            if socket.name in {"Specular", "Specular IOR Level"}:
+                specular_input = socket
+                break
+        if specular_input:
+            if getattr(specular_output, "type", "") != "VALUE":
+                rgb_to_bw = nodes.new("ShaderNodeRGBToBW")
+                rgb_to_bw.location = (-60, -340)
+                links.new(specular_output, rgb_to_bw.inputs["Color"])
+                links.new(rgb_to_bw.outputs["Val"], specular_input)
+            else:
+                links.new(specular_output, specular_input)
 
     if normal_node:
         normal_map = nodes.new("ShaderNodeNormalMap")
@@ -1035,6 +1173,10 @@ _update_status_text = "Update: not checked yet"
 _update_status_time = 0.0
 _last_export_warning = ""
 _pending_export_popup = False
+_cache_size_check_time = 0.0
+_cache_size_global = 0
+_cache_size_local = 0
+_cache_size_project_root = None
 
 
 def _set_update_status(kind, text, info=None):
@@ -1168,6 +1310,8 @@ def _enforce_selected_suffix_policy(context, prefs, operator=None):
 
 def _on_export_selected_only_update(self, context):
     if not self.export_selected_only:
+        if self.experimental_auto_split_selected:
+            self.experimental_auto_split_selected = False
         _set_export_warning("")
         return
     _enforce_selected_suffix_policy(context, self)
@@ -1261,6 +1405,34 @@ def start_update_check(show_no_update=False, show_popup=True):
     bpy.app.timers.register(_update_poll, first_interval=0.5)
 
 
+def get_cached_cache_sizes(context, prefs, max_age=5.0):
+    global _cache_size_check_time
+    global _cache_size_global
+    global _cache_size_local
+    global _cache_size_project_root
+    now = time.time()
+    project_dir = str(get_project_dir(context, prefs))
+    if (
+        _cache_size_project_root != project_dir
+        or now - _cache_size_check_time > max_age
+    ):
+        _cache_size_project_root = project_dir
+        _cache_size_global = bridge_cache_size_bytes(prefs)
+        _cache_size_local = project_cache_size_bytes(context, prefs)
+        _cache_size_check_time = now
+    return _cache_size_global, _cache_size_local
+
+
+def _init_scene_ui_prefs(_context=None):
+    prefs = get_prefs(bpy.context) if bpy.context else None
+    default_show = prefs.ui_show_export_settings if prefs else True
+    for scene in bpy.data.scenes:
+        if not getattr(scene, "gob_sp_ui_export_settings_initialized", False):
+            scene.gob_sp_ui_show_export_settings = default_show
+            scene.gob_sp_ui_export_settings_initialized = True
+    return None
+
+
 class GOBSPPreferences(AddonPreferences):
     bl_idname = __name__
 
@@ -1274,12 +1446,12 @@ class GOBSPPreferences(AddonPreferences):
         default=True,
     )
     export_high_poly: BoolProperty(
-        name="Export high poly if available",
+        name="Export Low Poly",
         default=True,
         update=_on_export_high_poly_update,
     )
     export_low_poly: BoolProperty(
-        name="Export low poly",
+        name="Export Low Poly",
         default=True,
         update=_on_export_low_poly_update,
     )
@@ -1593,25 +1765,19 @@ class GOB_PT_Panel(Panel):
     def draw(self, context):
         layout = self.layout
         prefs = get_prefs(context)
+        scene = context.scene
+        show_export = getattr(scene, "gob_sp_ui_show_export_settings", True)
         row = layout.row(align=True)
         row.operator(GOB_OT_SendToSP.bl_idname, icon="EXPORT")
         row.operator(GOB_OT_ImportFromSP.bl_idname, icon="IMPORT")
         layout.operator(GOB_OT_OpenExportFolder.bl_idname, icon="FILE_FOLDER")
-        if _last_export_warning:
-            warn_box = layout.box()
-            warn_box.label(text=_last_export_warning, icon="ERROR")
-        update_box = layout.box()
-        update_row = update_box.row(align=True)
-        update_row.label(text=_update_status_text)
-        update_row.operator(GOB_OT_CheckUpdates.bl_idname, text="Check")
-        if _last_update_info and _last_update_info.get("download_url"):
-            update_row.operator(GOB_OT_OpenUpdateURL.bl_idname, text="Download")
         if prefs:
             export_box = layout.box()
             row = export_box.row()
-            icon = "TRIA_DOWN" if prefs.ui_show_export_settings else "TRIA_RIGHT"
-            row.prop(prefs, "ui_show_export_settings", icon=icon, emboss=False, text="Export Options")
-            if prefs.ui_show_export_settings:
+            icon = "TRIA_DOWN" if show_export else "TRIA_RIGHT"
+            row.prop(scene, "gob_sp_ui_show_export_settings", icon=icon,
+                     emboss=False, text="Export Options")
+            if show_export:
                 col = export_box.column(align=True)
                 col.prop(prefs, "export_selected_only")
                 col.prop(prefs, "export_low_poly")
@@ -1647,12 +1813,15 @@ class GOB_PT_Panel(Panel):
                 fbx_box.label(text="Tip: if triangles too small, raise Export Scale")
 
             cache_box = layout.box()
+            global_size, local_size = get_cached_cache_sizes(context, prefs)
+            warn_size = format_bytes(CACHE_WARN_BYTES)
+            cache_label = "Cache"
+            if max(global_size, local_size) >= CACHE_WARN_BYTES:
+                cache_label = f"Cache (over {warn_size})"
             row = cache_box.row()
             icon = "TRIA_DOWN" if prefs.ui_show_cache else "TRIA_RIGHT"
-            row.prop(prefs, "ui_show_cache", icon=icon, emboss=False, text="Cache")
+            row.prop(prefs, "ui_show_cache", icon=icon, emboss=False, text=cache_label)
             if prefs.ui_show_cache:
-                global_size = bridge_cache_size_bytes(prefs)
-                local_size = project_cache_size_bytes(context, prefs)
                 cache_box.label(text=f"Global cache: {format_bytes(global_size)}")
                 cache_box.label(text=f"Project cache: {format_bytes(local_size)}")
                 row = cache_box.row(align=True)
@@ -1661,6 +1830,11 @@ class GOB_PT_Panel(Panel):
 
             links = layout.box()
             links.label(text="Community")
+            update_row = links.row(align=True)
+            update_row.label(text=_update_status_text)
+            update_row.operator(GOB_OT_CheckUpdates.bl_idname, text="Check")
+            if _last_update_info and _last_update_info.get("download_url"):
+                update_row.operator(GOB_OT_OpenUpdateURL.bl_idname, text="Download")
             links.operator(GOB_OT_OpenDiscord.bl_idname, icon="URL")
 
 
@@ -1681,9 +1855,30 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+    bpy.types.Scene.gob_sp_ui_show_export_settings = BoolProperty(
+        name="Show Export Settings",
+        default=True,
+    )
+    bpy.types.Scene.gob_sp_ui_export_settings_initialized = BoolProperty(
+        name="Export Settings Initialized",
+        default=False,
+        options={"HIDDEN"},
+    )
+    if _init_scene_ui_prefs not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_init_scene_ui_prefs)
+    if not bpy.app.timers.is_registered(_init_scene_ui_prefs):
+        bpy.app.timers.register(_init_scene_ui_prefs, first_interval=0.1)
     start_update_check(show_popup=False)
 
 
 def unregister():
+    if _init_scene_ui_prefs in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_init_scene_ui_prefs)
+    if bpy.app.timers.is_registered(_init_scene_ui_prefs):
+        bpy.app.timers.unregister(_init_scene_ui_prefs)
+    if hasattr(bpy.types.Scene, "gob_sp_ui_export_settings_initialized"):
+        del bpy.types.Scene.gob_sp_ui_export_settings_initialized
+    if hasattr(bpy.types.Scene, "gob_sp_ui_show_export_settings"):
+        del bpy.types.Scene.gob_sp_ui_show_export_settings
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

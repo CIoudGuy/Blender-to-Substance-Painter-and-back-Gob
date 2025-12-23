@@ -28,7 +28,7 @@ UPDATE_URL = (
     "https://raw.githubusercontent.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/"
     "refs/heads/main/version.json"
 )
-PLUGIN_VERSION = "0.1.6"
+PLUGIN_VERSION = "0.1.7"
 
 EXPORT_FORMATS = [
     ("png", "PNG"),
@@ -39,9 +39,10 @@ EXPORT_FORMATS = [
 EXPORT_BIT_DEPTHS = [
     ("8", "8-bit"),
     ("16", "16-bit"),
-    ("32", "32-bit"),
 ]
 EXPORT_RESOLUTIONS = [
+    (7, "128"),
+    (8, "256"),
     (9, "512"),
     (10, "1024"),
     (11, "2048"),
@@ -67,6 +68,8 @@ DEFAULT_EXPORT_SETTINGS = {
 CUSTOM_EXPORT_PRESETS = []
 SETTINGS_FILENAME = "gob_sp_settings.json"
 SETTINGS_VERSION = 1
+DEFAULT_USER_PRESET_NAME = "Default"
+UPDATE_IGNORE_VERSION_KEY = "update_ignore_version"
 
 
 def _rgb_channels(src_type, src_name):
@@ -264,6 +267,20 @@ def save_settings(data):
             json.dump(data, handle, indent=2, ensure_ascii=True)
     except OSError:
         return
+
+
+def get_update_ignore_version():
+    data = load_settings()
+    value = data.get(UPDATE_IGNORE_VERSION_KEY)
+    return str(value) if value else ""
+
+
+def set_update_ignore_version(version):
+    if not version:
+        return
+    data = load_settings()
+    data[UPDATE_IGNORE_VERSION_KEY] = str(version)
+    save_settings(data)
 
 
 def load_persistent_state():
@@ -490,7 +507,8 @@ def parse_update_data(data):
 
 def show_update_dialog(info):
     if not info:
-        return
+        return "cancel"
+    version = info.get("version")
     box = QtWidgets.QMessageBox()
     box.setIcon(QtWidgets.QMessageBox.Information)
     box.setWindowTitle("GoB Bridge Update")
@@ -500,19 +518,49 @@ def show_update_dialog(info):
     notes = info.get("notes")
     if notes:
         box.setInformativeText(str(notes))
-    open_button = None
+    download_button = None
     if info.get("download_url"):
-        open_button = box.addButton("Open Download", QtWidgets.QMessageBox.AcceptRole)
-    box.addButton("Later", QtWidgets.QMessageBox.RejectRole)
+        download_button = box.addButton("Download", QtWidgets.QMessageBox.AcceptRole)
+    dont_show_button = box.addButton("Don't show again", QtWidgets.QMessageBox.DestructiveRole)
+    cancel_button = box.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
     box.exec()
-    if open_button and box.clickedButton() == open_button:
-        QtGui.QDesktopServices.openUrl(QtCore.QUrl(info["download_url"]))
+    clicked = box.clickedButton()
+    if download_button and clicked == download_button:
+        if info.get("download_url"):
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl(info["download_url"]))
+        return "download"
+    if clicked == dont_show_button:
+        confirm = QtWidgets.QMessageBox.question(
+            box,
+            "GoB Bridge Update",
+            "Stop showing update notifications for this version?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        )
+        if confirm == QtWidgets.QMessageBox.Yes:
+            if version:
+                set_update_ignore_version(version)
+            return "dont_show"
+        return "cancel"
+    if clicked == cancel_button:
+        return "cancel"
+    return "cancel"
 
 
-def show_update_result(result, show_no_update=False):
+def show_update_result(result, show_no_update=False, force_prompt=False, auto_prompt=False):
     status = result.get("status") if result else None
     if status == "update":
-        show_update_dialog(result.get("info"))
+        info = result.get("info") or {}
+        version = info.get("version")
+        if not force_prompt and version:
+            ignored = get_update_ignore_version()
+            if ignored and ignored == version:
+                return
+        if auto_prompt and version:
+            global _update_prompted_version
+            if _update_prompted_version == version:
+                return
+            _update_prompted_version = version
+        show_update_dialog(info)
         return
     if not show_no_update:
         return
@@ -539,12 +587,15 @@ _update_check_timeout = 8.0
 _update_check_result = None
 _update_poll_timer = None
 _update_check_show_no_update = False
+_update_check_force_prompt = False
+_update_check_auto_prompt = False
 _update_net_manager = None
 _update_reply = None
 _update_timeout_timer = None
 _update_status_kind = "idle"
 _update_status_text = "Update: not checked yet"
 _last_update_info = None
+_update_prompted_version = None
 _update_status_callbacks = set()
 
 
@@ -578,10 +629,12 @@ def remove_update_listener(callback):
     _update_status_callbacks.discard(callback)
 
 
-def start_update_check(show_no_update=False):
+def start_update_check(show_no_update=False, force_prompt=False, auto_prompt=False):
     global _update_check_in_progress
     global _update_check_started_at
     global _update_check_show_no_update
+    global _update_check_force_prompt
+    global _update_check_auto_prompt
     global _update_check_result
     global _update_poll_timer
     global _update_net_manager
@@ -599,6 +652,8 @@ def start_update_check(show_no_update=False):
     _update_check_in_progress = True
     _update_check_started_at = time.time()
     _update_check_show_no_update = show_no_update
+    _update_check_force_prompt = force_prompt
+    _update_check_auto_prompt = auto_prompt
     _set_update_status("checking", "Update: checking...")
     _update_check_result = None
 
@@ -614,6 +669,8 @@ def start_update_check(show_no_update=False):
         global _update_reply
         global _update_timeout_timer
         global _update_check_show_no_update
+        global _update_check_force_prompt
+        global _update_check_auto_prompt
         if _update_timeout_timer is not None:
             try:
                 _update_timeout_timer.stop()
@@ -636,8 +693,15 @@ def start_update_check(show_no_update=False):
         else:
             error = result.get("error") if result else "Update check failed."
             _set_update_status("error", f"Update check failed: {error}")
-        show_update_result(result, show_no_update=_update_check_show_no_update)
+        show_update_result(
+            result,
+            show_no_update=_update_check_show_no_update,
+            force_prompt=_update_check_force_prompt,
+            auto_prompt=_update_check_auto_prompt,
+        )
         _update_check_show_no_update = False
+        _update_check_force_prompt = False
+        _update_check_auto_prompt = False
 
     def _handle_reply_finished():
         global _update_check_result
@@ -686,6 +750,33 @@ def show_message(title, text, icon=QtWidgets.QMessageBox.Information):
     box.setIcon(icon)
     box.setWindowTitle(title)
     box.setText(text)
+    box.exec()
+
+
+def show_warning_dialog(title, summary, details=None):
+    box = QtWidgets.QMessageBox()
+    box.setIcon(QtWidgets.QMessageBox.Information)
+    box.setWindowTitle(title)
+    box.setText(summary)
+    box.setSizeGripEnabled(True)
+    box.setWindowFlag(QtCore.Qt.WindowType.WindowMaximizeButtonHint, True)
+    layout = box.layout()
+    if layout:
+        layout.setSizeConstraint(QtWidgets.QLayout.SetNoConstraint)
+    if details:
+        box.setInformativeText(
+            "Suggestion: you can ignore these if the missing maps aren't needed.\n"
+            "Details are available below."
+        )
+        box.setDetailedText(details)
+        details_edit = box.findChild(QtWidgets.QTextEdit)
+        if details_edit:
+            details_edit.setMinimumSize(640, 320)
+            details_edit.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding,
+                QtWidgets.QSizePolicy.Expanding,
+            )
+    box.setMinimumSize(520, 220)
     box.exec()
 
 
@@ -1004,7 +1095,7 @@ def get_stack_for_textureset(texset, stack_name):
         return None
 
 
-def get_output_map_definitions(preset_info):
+def get_output_map_definitions(preset_info, stack=None):
     if not preset_info:
         return []
     if preset_info["kind"] == "custom":
@@ -1036,15 +1127,17 @@ def get_output_map_definitions(preset_info):
         try:
             for preset in sp.export.list_predefined_export_presets():
                 if preset.name == preset_info["name"]:
-                    stack = sp.textureset.get_active_stack()
-                    if not stack:
+                    target_stack = stack
+                    if not target_stack:
+                        target_stack = sp.textureset.get_active_stack()
+                    if not target_stack:
                         stacks = []
                         for texset in sp.textureset.all_texture_sets():
                             stacks.extend(texset.all_stacks())
-                        stack = stacks[0] if stacks else None
-                    if not stack:
+                        target_stack = stacks[0] if stacks else None
+                    if not target_stack:
                         return []
-                    return preset.list_output_maps(stack)
+                    return preset.list_output_maps(target_stack)
         except Exception:
             return []
     return []
@@ -1052,6 +1145,12 @@ def get_output_map_definitions(preset_info):
 
 def get_output_map_names(preset_info):
     return extract_output_map_names(get_output_map_definitions(preset_info))
+
+
+def normalize_map_key(value):
+    if value is None:
+        return ""
+    return re.sub(r"[^a-z0-9]", "", str(value).lower())
 
 
 DOC_MAP_TO_CHANNELS = {
@@ -1085,10 +1184,36 @@ DOC_MAP_TO_CHANNELS = {
 }
 
 
+def resolve_channel_names(doc_map_name):
+    if not doc_map_name:
+        return []
+    raw = str(doc_map_name).strip().lower()
+    key = normalize_map_key(raw)
+    names = []
+    direct = DOC_MAP_TO_CHANNELS.get(raw)
+    if direct:
+        names.extend(direct)
+    normalized = DOC_MAP_TO_CHANNELS.get(key)
+    if normalized:
+        names.extend(normalized)
+    members = getattr(sp.textureset.ChannelType, "__members__", {})
+    for channel_name in members:
+        if normalize_map_key(channel_name) == key:
+            names.append(channel_name)
+    seen = set()
+    unique = []
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        unique.append(name)
+    return unique
+
+
 def stack_has_doc_map(stack, doc_map_name):
     if not doc_map_name:
         return True
-    lookup = DOC_MAP_TO_CHANNELS.get(doc_map_name.lower())
+    lookup = resolve_channel_names(doc_map_name)
     if not lookup:
         return True
     found_type = False
@@ -1120,6 +1245,251 @@ def get_required_map_groups(map_def):
     return required_doc, required_input
 
 
+def collect_selected_stacks(selected_texture_sets=None, stack_roots=None):
+    roots = stack_roots if stack_roots is not None else collect_stack_roots(selected_texture_sets)
+    return [stack for _root, stack in roots]
+
+
+def collect_stack_roots(selected_texture_sets=None):
+    roots = []
+    selected_sets = None
+    if selected_texture_sets:
+        selected_sets = {name.lower() for name in selected_texture_sets if name}
+    for texset in sp.textureset.all_texture_sets():
+        texset_name = texset.name()
+        if selected_sets and texset_name.lower() not in selected_sets:
+            continue
+        tex_stacks = texset.all_stacks()
+        if not tex_stacks:
+            stack = get_stack_for_textureset(texset, "")
+            tex_stacks = [stack] if stack else []
+        for stack in tex_stacks:
+            if not stack:
+                continue
+            root = texset_name
+            try:
+                stack_name = stack.name()
+            except Exception:
+                stack_name = ""
+            if stack_name:
+                root = f"{texset_name}/{stack_name}"
+            roots.append((root, stack))
+    return roots
+
+
+def channel_display_name(doc_map_name):
+    if not doc_map_name:
+        return ""
+    lookup = resolve_channel_names(doc_map_name)
+    if lookup:
+        return lookup[0]
+    return str(doc_map_name)
+
+
+def ensure_stack_channel(stack, doc_map_name):
+    if not stack or not doc_map_name:
+        return False
+    if stack_has_doc_map(stack, doc_map_name):
+        return True
+    lookup = resolve_channel_names(doc_map_name)
+    for channel_name in lookup:
+        channel_type = sp.textureset.ChannelType.__members__.get(channel_name)
+        if not channel_type:
+            continue
+        try:
+            stack.add_channel(channel_type)
+        except Exception:
+            continue
+        try:
+            if stack.has_channel(channel_type):
+                return True
+        except Exception:
+            continue
+    return stack_has_doc_map(stack, doc_map_name)
+
+
+def collect_missing_map_channels(
+    preset_info,
+    selected_output_maps,
+    selected_texture_sets=None,
+    stack_roots=None,
+):
+    missing_by_map = {}
+    if not selected_output_maps:
+        return missing_by_map
+    selected = {str(name) for name in selected_output_maps if name}
+    roots = stack_roots if stack_roots is not None else collect_stack_roots(selected_texture_sets)
+    static_map_defs = None
+    if preset_info and preset_info.get("kind") in ("custom", "resource", "user"):
+        static_map_defs = get_output_map_definitions(preset_info)
+    for root, stack in roots:
+        map_defs = static_map_defs or get_output_map_definitions(preset_info, stack)
+        if not map_defs:
+            continue
+        for map_def in map_defs:
+            if isinstance(map_def, str):
+                map_name = map_def
+                if map_name not in selected:
+                    continue
+                continue
+            map_dict = map_def_to_dict(map_def)
+            if not map_dict:
+                continue
+            map_name = map_dict.get("fileName")
+            if not map_name or map_name not in selected:
+                continue
+            required_doc, required_input = get_required_map_groups(map_dict)
+            if not required_doc and not required_input:
+                continue
+            missing = []
+            for req in sorted(required_doc):
+                if not stack_has_doc_map(stack, req):
+                    missing.append(req)
+            for req in sorted(required_input):
+                if not stack_has_doc_map(stack, req):
+                    missing.append(req)
+            if missing:
+                missing_by_map.setdefault(map_name, {})[root] = missing
+    return missing_by_map
+
+
+def auto_enable_missing_channels(missing_by_map, selected_texture_sets=None, stack_roots=None):
+    if not missing_by_map:
+        return {}
+    roots = stack_roots if stack_roots is not None else collect_stack_roots(selected_texture_sets)
+    stack_lookup = {root: stack for root, stack in roots}
+    enabled = {}
+    for _map_name, root_info in missing_by_map.items():
+        for root, missing in root_info.items():
+            stack = stack_lookup.get(root)
+            if not stack:
+                continue
+            for name in missing:
+                if ensure_stack_channel(stack, name):
+                    enabled.setdefault(root, set()).add(name)
+    return enabled
+
+
+def channel_is_available(stack, channel):
+    if not stack or not channel:
+        return True
+    src_type = channel.get("srcMapType")
+    name = channel.get("srcMapName")
+    if not name or not src_type:
+        return True
+    if src_type in ("documentMap", "inputMap"):
+        return stack_has_doc_map(stack, name)
+    return True
+
+
+def channel_available_any_stack(channel, stacks):
+    if not stacks:
+        return True
+    for stack in stacks:
+        if channel_is_available(stack, channel):
+            return True
+    return False
+
+
+def channel_to_dict(channel):
+    if isinstance(channel, dict):
+        return dict(channel)
+    dest = getattr(channel, "destChannel", None) or getattr(channel, "dest_channel", None)
+    src = getattr(channel, "srcChannel", None) or getattr(channel, "src_channel", None)
+    src_type = getattr(channel, "srcMapType", None) or getattr(channel, "src_map_type", None)
+    src_name = getattr(channel, "srcMapName", None) or getattr(channel, "src_map_name", None)
+    data = {}
+    if dest is not None:
+        data["destChannel"] = dest
+    if src is not None:
+        data["srcChannel"] = src
+    if src_type is not None:
+        data["srcMapType"] = src_type
+    if src_name is not None:
+        data["srcMapName"] = src_name
+    return data or None
+
+
+def map_def_to_dict(map_def):
+    if isinstance(map_def, dict):
+        result = dict(map_def)
+        channels = result.get("channels")
+        if isinstance(channels, list):
+            converted = []
+            for channel in channels:
+                channel_dict = channel_to_dict(channel)
+                if channel_dict:
+                    converted.append(channel_dict)
+            if channels and not converted:
+                return None
+            if converted:
+                result["channels"] = converted
+        return result
+    file_name = getattr(map_def, "fileName", None) or getattr(map_def, "file_name", None)
+    if not file_name:
+        return None
+    result = {"fileName": file_name}
+    channels = getattr(map_def, "channels", None)
+    if channels is not None:
+        converted = []
+        for channel in channels:
+            channel_dict = channel_to_dict(channel)
+            if channel_dict:
+                converted.append(channel_dict)
+        if channels and not converted:
+            return None
+        if converted:
+            result["channels"] = converted
+    parameters = getattr(map_def, "parameters", None) or getattr(map_def, "params", None)
+    if parameters is not None:
+        result["parameters"] = parameters
+    return result
+
+
+def sanitize_map_definitions(preset_info, selected_texture_sets=None, stacks=None):
+    map_defs = get_output_map_definitions(preset_info)
+    if not map_defs:
+        return None, False, {}
+    stacks = stacks if stacks is not None else collect_selected_stacks(selected_texture_sets)
+    sanitized = []
+    changed = False
+    removed = {}
+    for map_def in map_defs:
+        if isinstance(map_def, str):
+            sanitized.append(map_def)
+            continue
+        map_dict = map_def_to_dict(map_def)
+        if not map_dict:
+            return None, False, {}
+        channels = map_dict.get("channels")
+        if channels:
+            kept = []
+            removed_channels = []
+            for channel in channels:
+                if channel_available_any_stack(channel, stacks):
+                    kept.append(channel)
+                else:
+                    name = channel.get("srcMapName")
+                    if name:
+                        removed_channels.append(str(name).lower())
+                    changed = True
+            if not kept:
+                changed = True
+                if removed_channels:
+                    map_name = map_dict.get("fileName")
+                    if map_name:
+                        removed.setdefault(map_name, set()).update(removed_channels)
+                continue
+            if len(kept) != len(channels):
+                map_dict["channels"] = kept
+                if removed_channels:
+                    map_name = map_dict.get("fileName")
+                    if map_name:
+                        removed.setdefault(map_name, set()).update(removed_channels)
+        sanitized.append(map_dict)
+    return sanitized, changed, removed
+
+
 def infer_normal_map_format_from_preset(preset_info):
     if not preset_info:
         return None
@@ -1144,58 +1514,78 @@ def infer_normal_map_format_from_preset(preset_info):
     return None
 
 
-def build_export_list_for_preset(preset_info, selected_output_maps, selected_texture_sets=None):
+def build_export_list_for_preset(
+    preset_info,
+    selected_output_maps,
+    selected_texture_sets=None,
+    stack_roots=None,
+):
     export_list = []
-    map_defs = get_output_map_definitions(preset_info)
-    if not map_defs:
-        return export_list
-    selected_sets = None
-    if selected_texture_sets:
-        selected_sets = {name.lower() for name in selected_texture_sets if name}
-    for texset in sp.textureset.all_texture_sets():
-        if selected_sets and texset.name().lower() not in selected_sets:
+    selected_map_set = {name for name in selected_output_maps if name}
+    if stack_roots is None:
+        selected_sets = None
+        if selected_texture_sets:
+            selected_sets = {name.lower() for name in selected_texture_sets if name}
+        stack_roots = []
+        for texset in sp.textureset.all_texture_sets():
+            if selected_sets and texset.name().lower() not in selected_sets:
+                continue
+            stacks = texset.all_stacks()
+            if not stacks:
+                stack = get_stack_for_textureset(texset, "")
+                stacks = [stack] if stack else []
+            for stack in stacks:
+                if not stack:
+                    continue
+                root = texset.name()
+                if stack.name():
+                    root = f"{root}/{stack.name()}"
+                stack_roots.append((root, stack))
+    static_map_defs = None
+    if preset_info and preset_info.get("kind") in ("custom", "resource", "user"):
+        static_map_defs = get_output_map_definitions(preset_info)
+    for root, stack in stack_roots:
+        if not stack:
             continue
-        stacks = texset.all_stacks()
-        if not stacks:
-            stack = get_stack_for_textureset(texset, "")
-            stacks = [stack] if stack else []
-        for stack in stacks:
-            if not stack:
-                continue
-            root = texset.name()
-            if stack.name():
-                root = f"{root}/{stack.name()}"
-            valid_maps = []
-            had_channel_info = False
-            for map_def in map_defs:
-                if isinstance(map_def, dict):
-                    map_name = map_def.get("fileName")
-                    if not map_name or map_name not in selected_output_maps:
-                        continue
-                    if map_def.get("channels"):
-                        had_channel_info = True
-                    required_doc, required_input = get_required_map_groups(map_def)
-                    missing_input = [
-                        req for req in required_input if not stack_has_doc_map(stack, req)
-                    ]
-                    if missing_input:
-                        continue
+        map_defs = static_map_defs or get_output_map_definitions(preset_info, stack)
+        if not map_defs:
+            continue
+        valid_maps = []
+        had_channel_info = False
+        for map_def in map_defs:
+            if isinstance(map_def, dict):
+                map_name = map_def.get("fileName")
+                if not map_name or map_name not in selected_map_set:
+                    continue
+                if map_def.get("channels"):
+                    had_channel_info = True
+                required_doc, required_input = get_required_map_groups(map_def)
+                missing_doc = [
+                    req for req in required_doc if not stack_has_doc_map(stack, req)
+                ]
+                if missing_doc:
+                    continue
+                missing_input = [
+                    req for req in required_input if not stack_has_doc_map(stack, req)
+                ]
+                if missing_input:
+                    continue
+                valid_maps.append(map_name)
+            elif isinstance(map_def, str):
+                if map_def in selected_map_set:
+                    valid_maps.append(map_def)
+            else:
+                map_name = getattr(map_def, "fileName", None) or getattr(map_def, "file_name", None)
+                if map_name and map_name in selected_map_set:
                     valid_maps.append(map_name)
-                elif isinstance(map_def, str):
-                    if map_def in selected_output_maps:
-                        valid_maps.append(map_def)
-                else:
-                    map_name = getattr(map_def, "fileName", None) or getattr(map_def, "file_name", None)
-                    if map_name and map_name in selected_output_maps:
-                        valid_maps.append(map_name)
-            if not valid_maps and selected_output_maps and not had_channel_info:
-                valid_maps = list(selected_output_maps)
-            if not valid_maps:
-                continue
-            export_list.append({
-                "rootPath": root,
-                "filter": {"outputMaps": valid_maps},
-            })
+        if not valid_maps and selected_output_maps and not had_channel_info:
+            valid_maps = list(selected_output_maps)
+        if not valid_maps:
+            continue
+        export_list.append({
+            "rootPath": root,
+            "filter": {"outputMaps": valid_maps},
+        })
     return export_list
 
 
@@ -1526,13 +1916,15 @@ class ExportDialog(QtWidgets.QDialog):
         self._user_presets = []
         self._pending_map_selection = None
         self._pending_texture_sets = None
+        self._default_preset_options = None
         self._loading = True
 
         state = load_persistent_state()
         self._last_state = state.get("last_settings", {})
         self._user_presets = [
             preset for preset in state.get("user_presets", [])
-            if isinstance(preset, dict) and preset.get("name")
+            if (isinstance(preset, dict) and preset.get("name") and
+                preset.get("name").lower() != DEFAULT_USER_PRESET_NAME.lower())
         ]
         self._pending_map_selection = self._last_state.get("output_maps")
         self._pending_texture_sets = self._last_state.get("texture_sets")
@@ -1540,7 +1932,8 @@ class ExportDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setSpacing(10)
         layout.setContentsMargins(12, 12, 12, 12)
-        self.setMinimumWidth(920)
+        self.setMinimumSize(860, 680)
+        self.resize(920, 700)
 
         header = QtWidgets.QLabel("GoB Bridge Export")
         header.setStyleSheet("font-weight: 600; font-size: 14px;")
@@ -1585,7 +1978,9 @@ class ExportDialog(QtWidgets.QDialog):
             sp.export.MeshExportOption.TessellationNormalsBaseMesh,
         )
         mesh_form.addRow("Mesh option", self.mesh_combo)
-        mesh_layout.addLayout(mesh_form)
+        self.mesh_options_widget = QtWidgets.QWidget()
+        self.mesh_options_widget.setLayout(mesh_form)
+        mesh_layout.addWidget(self.mesh_options_widget)
         layout.addWidget(self.mesh_group)
 
         self.texture_group = QtWidgets.QGroupBox("Texture Export")
@@ -1594,8 +1989,8 @@ class ExportDialog(QtWidgets.QDialog):
         self.textures_cb.setChecked(False)
         texture_layout.addWidget(self.textures_cb)
 
-        texture_split = QtWidgets.QHBoxLayout()
-        texture_layout.addLayout(texture_split)
+        self.texture_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        texture_layout.addWidget(self.texture_splitter, 1)
 
         self.texture_sets_group = QtWidgets.QGroupBox("Texture Sets")
         texset_layout = QtWidgets.QVBoxLayout(self.texture_sets_group)
@@ -1611,16 +2006,41 @@ class ExportDialog(QtWidgets.QDialog):
         texset_toolbar.addWidget(self.texset_refresh_btn)
         texset_layout.addLayout(texset_toolbar)
         self.texset_list = QtWidgets.QListWidget()
-        self.texset_list.setMinimumWidth(240)
+        self.texset_list.setMinimumWidth(280)
+        self.texset_list.setMinimumHeight(260)
         self.texset_list.setAlternatingRowColors(True)
         self.texset_list.setUniformItemSizes(True)
         self.texset_list.itemChanged.connect(self._update_texture_set_count)
         texset_layout.addWidget(self.texset_list)
-        texture_split.addWidget(self.texture_sets_group, 1)
+
+        self.map_group = QtWidgets.QGroupBox("List of Exports")
+        maps_layout = QtWidgets.QVBoxLayout(self.map_group)
+        map_toolbar = QtWidgets.QHBoxLayout()
+        self.map_status = QtWidgets.QLabel("Selected: 0/0")
+        map_toolbar.addWidget(self.map_status)
+        map_toolbar.addStretch()
+        self.select_all_btn = QtWidgets.QPushButton("Include All")
+        self.select_none_btn = QtWidgets.QPushButton("None")
+        self.refresh_maps_btn = QtWidgets.QPushButton("Refresh")
+        map_toolbar.addWidget(self.select_all_btn)
+        map_toolbar.addWidget(self.select_none_btn)
+        map_toolbar.addWidget(self.refresh_maps_btn)
+        maps_layout.addLayout(map_toolbar)
+        self.map_list = QtWidgets.QListWidget()
+        self.map_list.setMinimumHeight(260)
+        self.map_list.setAlternatingRowColors(False)
+        self.map_list.setUniformItemSizes(True)
+        self.map_list.itemChanged.connect(self._update_map_count)
+        maps_layout.addWidget(self.map_list)
+
+        left_panel = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addWidget(self.texture_sets_group)
+        left_layout.addWidget(self.map_group)
 
         self.texture_params_group = QtWidgets.QGroupBox("General Export Parameters")
         params_form = QtWidgets.QFormLayout(self.texture_params_group)
-
         self.output_dir_edit = QtWidgets.QLineEdit()
         self.output_dir_edit.setReadOnly(True)
         self.output_dir_edit.setText(str(get_project_dir() / "textures"))
@@ -1694,28 +2114,16 @@ class ExportDialog(QtWidgets.QDialog):
         self.dither_cb.setChecked(DEFAULT_EXPORT_SETTINGS["dithering"])
         params_form.addRow(self.dither_cb)
 
-        texture_split.addWidget(self.texture_params_group, 2)
+        right_panel = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(self.texture_params_group)
 
-        self.map_group = QtWidgets.QGroupBox("List of Exports")
-        maps_layout = QtWidgets.QVBoxLayout(self.map_group)
-        map_toolbar = QtWidgets.QHBoxLayout()
-        self.map_status = QtWidgets.QLabel("Selected: 0/0")
-        map_toolbar.addWidget(self.map_status)
-        map_toolbar.addStretch()
-        self.select_all_btn = QtWidgets.QPushButton("Include All")
-        self.select_none_btn = QtWidgets.QPushButton("None")
-        self.refresh_maps_btn = QtWidgets.QPushButton("Refresh")
-        map_toolbar.addWidget(self.select_all_btn)
-        map_toolbar.addWidget(self.select_none_btn)
-        map_toolbar.addWidget(self.refresh_maps_btn)
-        maps_layout.addLayout(map_toolbar)
-        self.map_list = QtWidgets.QListWidget()
-        self.map_list.setMinimumHeight(240)
-        self.map_list.setAlternatingRowColors(False)
-        self.map_list.setUniformItemSizes(True)
-        self.map_list.itemChanged.connect(self._update_map_count)
-        maps_layout.addWidget(self.map_list)
-        texture_layout.addWidget(self.map_group)
+        self.texture_splitter.addWidget(left_panel)
+        self.texture_splitter.addWidget(right_panel)
+        self.texture_splitter.setStretchFactor(0, 3)
+        self.texture_splitter.setStretchFactor(1, 2)
+        self.texture_splitter.setSizes([380, 520])
 
         layout.addWidget(self.texture_group)
 
@@ -1727,7 +2135,7 @@ class ExportDialog(QtWidgets.QDialog):
         layout.addWidget(buttons)
 
         self.textures_cb.toggled.connect(self._on_textures_toggle)
-        self.mesh_cb.toggled.connect(self.mesh_combo.setEnabled)
+        self.mesh_cb.toggled.connect(self._on_mesh_toggle)
         self.preset_search.textChanged.connect(self._filter_presets)
         self.preset_combo.currentIndexChanged.connect(self._refresh_map_list)
         self.select_all_btn.clicked.connect(lambda: self._set_all_map_checks(True))
@@ -1740,21 +2148,36 @@ class ExportDialog(QtWidgets.QDialog):
         self.save_preset_btn.clicked.connect(self._save_user_preset)
         self.delete_preset_btn.clicked.connect(self._delete_user_preset)
         self.user_preset_combo.currentIndexChanged.connect(self._apply_user_preset_selection)
-        self.update_check_btn.clicked.connect(lambda: start_update_check(show_no_update=True))
+        self.update_check_btn.clicked.connect(lambda: start_update_check(show_no_update=True, force_prompt=True))
         self.update_download_btn.clicked.connect(self._open_update_download)
         add_update_listener(self._refresh_update_status)
 
         self._populate_texture_sets()
         self._all_presets = collect_export_presets()
         self._filter_presets("")
+        if not self._last_state or not self._last_state.get("preset"):
+            default_preset = self._find_default_export_preset()
+            if default_preset:
+                self._select_preset_by_ref({
+                    "kind": default_preset.get("kind"),
+                    "name": default_preset.get("name"),
+                })
+        self._default_preset_options = self._build_default_preset_options()
         self._reload_user_presets()
         self._apply_saved_state(self._last_state)
         self._on_textures_toggle(self.textures_cb.isChecked())
+        self._on_mesh_toggle(self.mesh_cb.isChecked())
         self._loading = False
         self._refresh_update_status()
 
     def closeEvent(self, event):
         remove_update_listener(self._refresh_update_status)
+        try:
+            options = self.get_options()
+            state = self._serialize_options(options)
+            save_persistent_state(last_settings=state, user_presets=self._user_presets)
+        except Exception:
+            pass
         super().closeEvent(event)
 
     def _refresh_update_status(self):
@@ -1778,9 +2201,18 @@ class ExportDialog(QtWidgets.QDialog):
         self.texture_sets_group.setEnabled(enabled)
         self.texture_params_group.setEnabled(enabled)
         self.map_group.setEnabled(enabled)
+        self.texture_splitter.setVisible(enabled)
         if self._loading:
             return
+        if not enabled:
+            self._capture_texture_selection()
+            return
+        self._apply_pending_texture_sets()
         self._refresh_map_list()
+
+    def _on_mesh_toggle(self, enabled):
+        self.mesh_combo.setEnabled(enabled)
+        self.mesh_options_widget.setVisible(enabled)
 
     def _set_all_texture_set_checks(self, checked):
         for i in range(self.texset_list.count()):
@@ -1889,6 +2321,30 @@ class ExportDialog(QtWidgets.QDialog):
         self.preset_combo.setEnabled(self.textures_cb.isChecked() and self.preset_combo.count() > 0)
         self._refresh_map_list()
 
+    def _capture_texture_selection(self):
+        maps = []
+        map_count = 0
+        for i in range(self.map_list.count()):
+            item = self.map_list.item(i)
+            if not (item.flags() & QtCore.Qt.ItemIsUserCheckable):
+                continue
+            map_count += 1
+            if item.checkState() == QtCore.Qt.Checked:
+                maps.append(item.data(QtCore.Qt.UserRole))
+        sets = []
+        set_count = 0
+        for i in range(self.texset_list.count()):
+            item = self.texset_list.item(i)
+            if not (item.flags() & QtCore.Qt.ItemIsUserCheckable):
+                continue
+            set_count += 1
+            if item.checkState() == QtCore.Qt.Checked:
+                sets.append(item.data(QtCore.Qt.UserRole))
+        if map_count:
+            self._pending_map_selection = maps
+        if set_count:
+            self._pending_texture_sets = sets
+
     def _refresh_map_list(self):
         self.map_list.clear()
         if (not self.textures_cb.isChecked() or self.preset_combo.count() == 0 or
@@ -1989,12 +2445,24 @@ class ExportDialog(QtWidgets.QDialog):
                 pass
         if "dithering" in export_settings:
             self.dither_cb.setChecked(bool(export_settings["dithering"]))
+        splitter_sizes = state.get("texture_splitter_sizes")
+        if isinstance(splitter_sizes, list) and len(splitter_sizes) == 2:
+            try:
+                self.texture_splitter.setSizes([int(splitter_sizes[0]), int(splitter_sizes[1])])
+            except (TypeError, ValueError):
+                pass
         preset_ref = state.get("preset")
         if preset_ref:
             self._select_preset_by_ref(preset_ref)
         self._pending_map_selection = state.get("output_maps")
-        self._pending_texture_sets = state.get("texture_sets")
-        self._apply_pending_texture_sets()
+        if "texture_sets" in state:
+            texture_sets = state.get("texture_sets")
+            if texture_sets is None:
+                self._pending_texture_sets = None
+                self._set_all_texture_set_checks(True)
+            else:
+                self._pending_texture_sets = texture_sets
+                self._apply_pending_texture_sets()
         self._refresh_map_list()
 
     def _serialize_options(self, options):
@@ -2004,6 +2472,17 @@ class ExportDialog(QtWidgets.QDialog):
             preset_ref = {"kind": preset.get("kind"), "name": preset.get("name")}
         mesh_option = options.get("mesh_option")
         mesh_key = mesh_option_key(mesh_option) if mesh_option is not None else None
+        texture_sets = options.get("texture_sets", [])
+        texture_sets_value = texture_sets
+        try:
+            all_sets = [texset.name() for texset in sp.textureset.all_texture_sets()]
+        except Exception:
+            all_sets = None
+        if all_sets:
+            all_set_names = {name.lower() for name in all_sets if name}
+            if texture_sets and len(texture_sets) == len(all_sets):
+                if all(name.lower() in all_set_names for name in texture_sets):
+                    texture_sets_value = None
         return {
             "export_mesh": options.get("export_mesh", True),
             "export_textures": options.get("export_textures", True),
@@ -2011,14 +2490,24 @@ class ExportDialog(QtWidgets.QDialog):
             "preset": preset_ref,
             "output_maps": options.get("output_maps", []),
             "export_settings": options.get("export_settings", {}),
-            "texture_sets": options.get("texture_sets", []),
+            "texture_sets": texture_sets_value,
+            "texture_splitter_sizes": (
+                self.texture_splitter.sizes() if hasattr(self, "texture_splitter") else None
+            ),
         }
 
     def _reload_user_presets(self, select_name=None):
+        current = ""
+        if self.user_preset_combo.count() > 0:
+            current = self.user_preset_combo.currentText()
+        if select_name is None:
+            select_name = current
         self.user_preset_combo.blockSignals(True)
         self.user_preset_combo.clear()
-        self.user_preset_combo.addItem("Custom")
+        self.user_preset_combo.addItem(DEFAULT_USER_PRESET_NAME)
         selected_index = 0
+        if select_name and select_name.lower() == DEFAULT_USER_PRESET_NAME.lower():
+            selected_index = 0
         for preset in self._user_presets:
             name = preset.get("name")
             if not name:
@@ -2028,16 +2517,25 @@ class ExportDialog(QtWidgets.QDialog):
                 selected_index = self.user_preset_combo.count() - 1
         self.user_preset_combo.setCurrentIndex(selected_index)
         self.user_preset_combo.blockSignals(False)
+        self._update_preset_buttons()
+
+    def _update_preset_buttons(self):
+        index = self.user_preset_combo.currentIndex()
+        self.delete_preset_btn.setEnabled(index > 0)
 
     def _apply_user_preset_selection(self, index):
-        if self._loading or index <= 0:
+        if self._loading or index < 0:
             return
-        preset = self._user_presets[index - 1]
-        options = preset.get("options", {})
+        if index == 0:
+            options = self._default_preset_options or self._build_default_preset_options()
+        else:
+            preset = self._user_presets[index - 1]
+            options = preset.get("options", {})
         self._loading = True
         self._apply_saved_state(options)
         self._on_textures_toggle(self.textures_cb.isChecked())
         self._loading = False
+        self._update_preset_buttons()
 
     def _save_user_preset(self):
         current_name = ""
@@ -2053,6 +2551,13 @@ class ExportDialog(QtWidgets.QDialog):
             return
         name = name.strip()
         if not name:
+            return
+        if name.lower() == DEFAULT_USER_PRESET_NAME.lower():
+            show_message(
+                "GoB Bridge",
+                f"'{DEFAULT_USER_PRESET_NAME}' is reserved and cannot be overwritten.",
+                QtWidgets.QMessageBox.Warning,
+            )
             return
         options = self._serialize_options(self.get_options())
         existing_index = None
@@ -2084,9 +2589,49 @@ class ExportDialog(QtWidgets.QDialog):
         save_persistent_state(user_presets=self._user_presets)
         self._reload_user_presets()
 
+    def _build_default_preset_options(self):
+        mesh_option = None
+        if self.mesh_combo.count() > 0:
+            mesh_option = self.mesh_combo.itemData(0)
+        preset_ref = None
+        preset = self._find_default_export_preset()
+        if preset:
+            preset_ref = {
+                "kind": preset.get("kind"),
+                "name": preset.get("name"),
+            }
+        return {
+            "mesh_option": mesh_option,
+            "preset": preset_ref,
+            "output_maps": None,
+            "export_settings": dict(DEFAULT_EXPORT_SETTINGS),
+            "texture_sets": None,
+            "texture_splitter_sizes": self.texture_splitter.sizes(),
+        }
+
+    def _find_default_export_preset(self):
+        candidates = self._all_presets or self._presets or []
+        if not candidates:
+            return None
+        def haystack(preset):
+            return f"{preset.get('name', '')} {preset.get('label', '')}".lower()
+        for preset in candidates:
+            text = haystack(preset)
+            if "blender" in text and ("principled" in text or "bsdf" in text):
+                return preset
+        for preset in candidates:
+            text = haystack(preset)
+            if "blender" in text:
+                return preset
+        for preset in candidates:
+            text = haystack(preset)
+            if "principled" in text or "bsdf" in text:
+                return preset
+        return candidates[0]
+
     def get_options(self):
         preset = None
-        if self.preset_combo.isEnabled() and self._presets and self.preset_combo.currentIndex() >= 0:
+        if self._presets and self.preset_combo.currentIndex() >= 0:
             preset = self._presets[self.preset_combo.currentIndex()]
         output_maps = []
         for i in range(self.map_list.count()):
@@ -2133,23 +2678,18 @@ class QuickPanel(QtWidgets.QWidget):
         layout.setSpacing(2)
         self.import_btn = QtWidgets.QToolButton()
         self.export_btn = QtWidgets.QToolButton()
-        self.update_btn = QtWidgets.QToolButton()
         self.import_btn.setText("GoB Import")
         self.export_btn.setText("GoB Export")
-        self.update_btn.setText("Check Update")
-        for btn in (self.import_btn, self.export_btn, self.update_btn):
+        for btn in (self.import_btn, self.export_btn):
             btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
             btn.setAutoRaise(True)
             btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.import_btn.setToolTip("Import from Blender")
         self.export_btn.setToolTip("Send to Blender")
-        self.update_btn.setToolTip("Check for updates")
         self.import_btn.clicked.connect(import_from_blender)
         self.export_btn.clicked.connect(send_to_blender)
-        self.update_btn.clicked.connect(lambda: start_update_check(show_no_update=True))
         layout.addWidget(self.import_btn)
         layout.addWidget(self.export_btn)
-        layout.addWidget(self.update_btn)
 
 
 def _resolve_export_shelf():
@@ -2207,6 +2747,23 @@ def manifest_timestamp(manifest, manifest_path):
         return 0.0
 
 
+def manifest_targets_current_project(manifest, manifest_path):
+    if not sp.project.is_open():
+        return True
+    try:
+        current_dir = get_project_dir()
+    except Exception:
+        current_dir = None
+    manifest_dir = Path(manifest_path).parent if manifest_path else None
+    if current_dir and manifest_dir and current_dir == manifest_dir:
+        return True
+    current_name = get_project_name()
+    manifest_name = sanitize_name(str(manifest.get("project") or ""))
+    if current_name and manifest_name:
+        return current_name.lower() == manifest_name.lower()
+    return False
+
+
 def import_from_blender(manifest_path=None, clear_auto_import=False):
     global _auto_import_in_progress
     bridge_roots = get_candidate_bridge_roots()
@@ -2245,6 +2802,15 @@ def import_from_blender(manifest_path=None, clear_auto_import=False):
         return
 
     if sp.project.is_open() and not force_new_project:
+        if clear_auto_import and not manifest_targets_current_project(manifest, manifest_path):
+            if clear_auto_import:
+                clear_auto_import_flag(manifest_path, manifest)
+            show_message(
+                "GoB Bridge",
+                "Blender export targets a different project. Close the current project and import again.",
+                QtWidgets.QMessageBox.Warning,
+            )
+            return
         if not sp.project.is_in_edition_state():
             return
         settings = sp.project.MeshReloadingSettings(
@@ -2334,6 +2900,7 @@ def send_to_blender():
     }
     exported_any = False
     texture_errors = []
+    texture_warnings = []
 
     if options["export_mesh"]:
         mesh_path = project_dir / SP_EXPORT_FILENAME
@@ -2366,21 +2933,155 @@ def send_to_blender():
             elif not texture_sets:
                 texture_errors.append("No texture sets selected.")
             else:
+                stack_roots = collect_stack_roots(texture_sets)
+                stacks = [stack for _root, stack in stack_roots]
+                missing_before = collect_missing_map_channels(
+                    preset,
+                    output_maps,
+                    texture_sets,
+                    stack_roots=stack_roots,
+                )
+                auto_enabled = auto_enable_missing_channels(
+                    missing_before,
+                    texture_sets,
+                    stack_roots=stack_roots,
+                )
+                preset_for_export = preset
+                sanitized_maps, changed, removed_channels = sanitize_map_definitions(
+                    preset,
+                    texture_sets,
+                    stacks=stacks,
+                )
+                if sanitized_maps and changed:
+                    base_name = preset.get("name") or "Custom Preset"
+                    custom_name = f"{base_name} (GoB)"
+                    preset_for_export = {
+                        "kind": "custom",
+                        "name": custom_name,
+                        "definition": {
+                            "name": custom_name,
+                            "maps": sanitized_maps,
+                        },
+                    }
                 export_settings = options.get("export_settings") or DEFAULT_EXPORT_SETTINGS
                 export_params = build_export_parameters(export_settings)
-                export_list = build_export_list_for_preset(preset, output_maps, texture_sets)
+                export_list = build_export_list_for_preset(
+                    preset_for_export,
+                    output_maps,
+                    texture_sets,
+                    stack_roots=stack_roots,
+                )
                 if not export_list:
                     texture_errors.append("No matching maps found for the current texture sets.")
                 else:
+                    missing_after = collect_missing_map_channels(
+                        preset_for_export,
+                        output_maps,
+                        texture_sets,
+                        stack_roots=stack_roots,
+                    )
+                    selected_roots = [root for root, _stack in stack_roots]
+                    selected_map_names = [name for name in output_maps if name]
+                    exported_by_root = {}
+                    for entry in export_list:
+                        root = entry.get("rootPath")
+                        maps = entry.get("filter", {}).get("outputMaps", []) or []
+                        if root:
+                            exported_by_root[root] = set(maps)
+                    roots_without_exports = [
+                        root for root in selected_roots if not exported_by_root.get(root)
+                    ]
+                    skipped_missing = {}
+                    for map_name, roots in missing_after.items():
+                        for root, names in roots.items():
+                            if map_name not in exported_by_root.get(root, set()):
+                                skipped_missing.setdefault(map_name, {})[root] = names
+                    skipped_unknown = {}
+                    for root in selected_roots:
+                        if root in roots_without_exports:
+                            continue
+                        exported = exported_by_root.get(root, set())
+                        for map_name in selected_map_names:
+                            if map_name in exported:
+                                continue
+                            if root in skipped_missing.get(map_name, {}):
+                                continue
+                            skipped_unknown.setdefault(map_name, []).append(root)
+                    if (auto_enabled or removed_channels or skipped_missing or
+                            skipped_unknown or roots_without_exports):
+                        preset_label = preset.get("label") or preset.get("name") or "Selected template"
+                        warning_lines = [f"Template: {preset_label}"]
+                        if auto_enabled:
+                            enabled_parts = []
+                            for root in sorted(auto_enabled):
+                                names = sorted(auto_enabled[root])
+                                labels = ", ".join(channel_display_name(name) for name in names)
+                                enabled_parts.append(f"{root}: {labels}")
+                            if enabled_parts:
+                                warning_lines.append(
+                                    "Auto-enabled channels:\n" + "\n".join(enabled_parts)
+                                )
+                        if removed_channels:
+                            removed_lines = []
+                            for map_name in sorted(removed_channels):
+                                names = sorted(removed_channels[map_name])
+                                labels = ", ".join(channel_display_name(name) for name in names)
+                                removed_lines.append(
+                                    f"{friendly_map_label(map_name)}: {labels}"
+                                )
+                            if removed_lines:
+                                warning_lines.append(
+                                    "Channels removed from the template (missing on all selected texture sets):\n"
+                                    + "\n".join(removed_lines)
+                                )
+                        if roots_without_exports:
+                            warning_lines.append(
+                                "No output maps were generated for:\n"
+                                + "\n".join(sorted(roots_without_exports))
+                            )
+                        if skipped_missing:
+                            missing_lines = []
+                            for map_name in sorted(skipped_missing):
+                                roots = skipped_missing[map_name]
+                                root_parts = []
+                                for root in sorted(roots):
+                                    names = sorted(set(roots[root]))
+                                    labels = ", ".join(channel_display_name(name) for name in names)
+                                    root_parts.append(f"{root}: {labels}")
+                                missing_lines.append(
+                                    f"{friendly_map_label(map_name)} -> " + "; ".join(root_parts)
+                                )
+                            if missing_lines:
+                                warning_lines.append(
+                                    "Skipped maps for some texture sets (missing channels):\n"
+                                    + "\n".join(missing_lines)
+                                )
+                        if skipped_unknown:
+                            unknown_lines = []
+                            for map_name in sorted(skipped_unknown):
+                                roots = "; ".join(sorted(skipped_unknown[map_name]))
+                                unknown_lines.append(
+                                    f"{friendly_map_label(map_name)} -> {roots}"
+                                )
+                            if unknown_lines:
+                                warning_lines.append(
+                                    "Skipped maps for some texture sets (template output not generated):\n"
+                                    + "\n".join(unknown_lines)
+                                )
+                        warning_lines.append(
+                            "Enable missing channels via Texture Set Settings > Channels (+) "
+                            "for the affected texture sets."
+                        )
+                        texture_warnings.append("\n\n".join(warning_lines))
                     attempts = []
-                    if preset["kind"] == "custom":
-                        attempts.append(("custom", preset))
+                    if preset_for_export["kind"] == "custom":
+                        attempts.append(("custom", preset_for_export))
                     else:
-                        attempts.append(("url", preset))
-                        if preset["kind"] == "resource":
+                        attempts.append(("url", preset_for_export))
+                        if preset_for_export["kind"] == "resource":
                             for fallback in collect_export_presets():
                                 if (fallback["kind"] == "predefined" and
-                                        fallback["name"].lower() == preset["name"].lower()):
+                                        fallback["name"].lower() == preset_for_export["name"].lower()):
                                     attempts.append(("predefined_url", fallback))
                                     break
                     tried = False
@@ -2441,6 +3142,9 @@ def send_to_blender():
     if texture_errors:
         details = "\n".join(texture_errors)
         show_message("GoB Bridge", f"Texture export failed:\n{details}", QtWidgets.QMessageBox.Warning)
+    elif texture_warnings:
+        details = "\n\n".join(texture_warnings)
+        show_warning_dialog("GoB Bridge", "Export complete (optional maps missing).", details)
     else:
         show_message("GoB Bridge", "Export complete. Use Blender to import.")
 
@@ -2465,11 +3169,6 @@ def start_plugin():
     sp.ui.add_action(sp.ui.ApplicationMenu.File, action_send)
     _ui_elements.append(action_send)
 
-    action_update = QtGui.QAction("GoB Bridge: Check for Updates")
-    action_update.triggered.connect(lambda: start_update_check(show_no_update=True))
-    sp.ui.add_action(sp.ui.ApplicationMenu.File, action_update)
-    _ui_elements.append(action_update)
-
     try:
         quick_element = _add_quick_panel_ui()
         if quick_element is not None:
@@ -2477,6 +3176,10 @@ def start_plugin():
     except Exception:
         pass
     write_active_sp_info()
+    try:
+        start_update_check(auto_prompt=True)
+    except Exception:
+        pass
     def _auto_import_poll():
         global _auto_import_last_time
         global _auto_import_last_path
