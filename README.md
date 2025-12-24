@@ -26,7 +26,7 @@ Partially tested on macOs
 ‎ 
 ‎ 
 ‎  
-# Installation
+# [‎<ins>Installation</ins>](https://github.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/releases)
 ## Blender
 Edit > Preferences > Addons > Install from disk > Select the zip or the .py file > Done
 
