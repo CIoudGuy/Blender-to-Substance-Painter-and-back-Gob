@@ -20,7 +20,7 @@ Virus checks: [bl.py](https://www.virustotal.com/gui/file/e9064dd4d643129648bfeb
 
 Partially tested on macOs
 
-### PLEASE REPORT ANY BUGS YOU FIND ⚠️
+### PLEASE REPORT ANY BUGS YOU FIND [HERE](https://github.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/issues) ⚠️
 
 ‎ 
 ‎ 
