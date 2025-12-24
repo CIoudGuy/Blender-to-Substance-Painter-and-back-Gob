@@ -1,4 +1,4 @@
-# Blender to Substance Painter (and back) GOB
+# Blender to Substance Painter (and back) GOB - Bridge
 These scripts will allow you to export from Blender to Substance Painter and vice versa
 
 Make sure to install both of them.
