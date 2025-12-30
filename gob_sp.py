@@ -2,6 +2,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -21,14 +22,28 @@ MANIFEST_FILENAME = "bridge.json"
 BLENDER_EXPORT_FILENAME = "b2sp.fbx"
 SP_EXPORT_FILENAME = "sp2b.fbx"
 LOG_FILENAME = "sp_export_log.txt"
+PROJECT_META_DIRNAME = ".gob_meta"
 ACTIVE_SP_INFO_FILENAME = "active_sp.json"
+ACTIVE_BLENDER_INFO_FILENAME = "active_blender.json"
+LINKS_FILENAME = "project_links.json"
+TEMP_DIRNAME = ".gob_temp"
+TEMP_SP_PREFIX = "gob_unsaved_sp_"
+TEMP_BLENDER_PREFIX = "gob_unsaved_bl_"
+TEMP_SP_SUFFIX = ".spp"
+TEMP_BLENDER_SUFFIX = ".blend"
 HIGH_POLY_RETRY_DELAY_MS = 800
 HIGH_POLY_RETRY_COUNT = 60
+ACTIVE_BLENDER_INFO_MAX_AGE = 120.0
+FORCE_NEW_TOKEN_ENV = "GOB_SP_FORCE_NEW_TOKEN"
+FORCE_NEW_TOKEN_ARG_PREFIXES = ("--gob-force-new-token=", "--gob-force-new=")
 UPDATE_URL = (
     "https://raw.githubusercontent.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/"
     "refs/heads/main/version.json"
 )
-PLUGIN_VERSION = "0.1.7"
+BUG_REPORT_URL = (
+    "https://github.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/issues"
+)
+PLUGIN_VERSION = "0.2.0"
 
 EXPORT_FORMATS = [
     ("png", "PNG"),
@@ -68,8 +83,15 @@ DEFAULT_EXPORT_SETTINGS = {
 CUSTOM_EXPORT_PRESETS = []
 SETTINGS_FILENAME = "gob_sp_settings.json"
 SETTINGS_VERSION = 1
+PROJECT_SETTINGS_FILENAME = "gob_sp_project_settings.json"
 DEFAULT_USER_PRESET_NAME = "Default"
 UPDATE_IGNORE_VERSION_KEY = "update_ignore_version"
+_temp_session_id = None
+_temp_sp_project_file = None
+_temp_blender_file = None
+_last_sp_project_file = None
+_project_dir_cache = {}
+_force_new_token = ""
 
 
 def _rgb_channels(src_type, src_name):
@@ -202,6 +224,26 @@ def default_bridge_dir():
     return os.path.join(os.path.expanduser("~"), "Documents", "GoB_SP_Bridge")
 
 
+def documents_bridge_root():
+    if sys.platform == "darwin":
+        icloud_docs = (
+            Path.home()
+            / "Library"
+            / "Mobile Documents"
+            / "com~apple~CloudDocs"
+            / "Documents"
+        )
+        if icloud_docs.is_dir():
+            return icloud_docs / "GoB_SP_Bridge"
+    docs = QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.DocumentsLocation)
+    if docs:
+        return Path(docs) / "GoB_SP_Bridge"
+    win_docs = windows_documents_dir()
+    if win_docs:
+        return Path(win_docs) / "GoB_SP_Bridge"
+    return Path(os.path.expanduser("~")) / "Documents" / "GoB_SP_Bridge"
+
+
 def bridge_root_hint_path():
     return Path(default_bridge_dir()).expanduser() / BRIDGE_ROOT_HINT_FILENAME
 
@@ -269,6 +311,96 @@ def save_settings(data):
         return
 
 
+def project_manifest_path(project_dir):
+    if not project_dir:
+        return None
+    return project_meta_dir(project_dir) / MANIFEST_FILENAME
+
+
+def legacy_project_manifest_path(project_dir):
+    if not project_dir:
+        return None
+    return Path(project_dir) / MANIFEST_FILENAME
+
+
+def find_project_manifest_path(project_dir):
+    if not project_dir:
+        return None
+    new_path = project_manifest_path(project_dir)
+    if new_path and new_path.exists():
+        return new_path
+    legacy_path = legacy_project_manifest_path(project_dir)
+    if legacy_path and legacy_path.exists():
+        return legacy_path
+    return new_path
+
+
+def project_dir_from_manifest_path(manifest_path):
+    if not manifest_path:
+        return None
+    path = Path(manifest_path)
+    if path.parent.name == PROJECT_META_DIRNAME:
+        return path.parent.parent
+    return path.parent
+
+
+def project_settings_path(project_dir=None):
+    if project_dir is None:
+        try:
+            project_dir = get_project_dir()
+        except Exception:
+            return None
+    if not project_dir:
+        return None
+    return project_meta_dir(project_dir) / PROJECT_SETTINGS_FILENAME
+
+
+def load_project_settings(project_dir=None):
+    base_dir = project_dir
+    if base_dir is None:
+        try:
+            base_dir = get_project_dir()
+        except Exception:
+            return {}
+    if not base_dir:
+        return {}
+    path = project_meta_dir(base_dir) / PROJECT_SETTINGS_FILENAME
+    if not path.exists():
+        legacy_path = Path(base_dir) / PROJECT_SETTINGS_FILENAME
+        if legacy_path.exists():
+            path = legacy_path
+        else:
+            return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_project_settings(data, project_dir=None):
+    path = project_settings_path(project_dir)
+    if not path:
+        return
+    ensure_dir(path.parent)
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=True)
+    except OSError:
+        return
+
+
+def update_project_settings(update_data, project_dir=None):
+    if not update_data:
+        return
+    data = load_project_settings(project_dir)
+    if not isinstance(data, dict):
+        data = {}
+    data.update(update_data)
+    save_project_settings(data, project_dir=project_dir)
+
+
 def get_update_ignore_version():
     data = load_settings()
     value = data.get(UPDATE_IGNORE_VERSION_KEY)
@@ -283,16 +415,20 @@ def set_update_ignore_version(version):
     save_settings(data)
 
 
-def load_persistent_state():
+def load_persistent_state(project_dir=None):
     data = load_settings()
+    project_data = load_project_settings(project_dir)
+    last_settings = project_data.get("last_settings")
+    if last_settings is None:
+        last_settings = data.get("last_settings", {})
     return {
         "version": data.get("version", SETTINGS_VERSION),
-        "last_settings": data.get("last_settings", {}),
+        "last_settings": last_settings,
         "user_presets": data.get("user_presets", []),
     }
 
 
-def save_persistent_state(last_settings=None, user_presets=None):
+def save_persistent_state(last_settings=None, user_presets=None, project_dir=None):
     data = load_settings()
     if not isinstance(data, dict):
         data = {}
@@ -302,6 +438,13 @@ def save_persistent_state(last_settings=None, user_presets=None):
         data["user_presets"] = user_presets
     data["version"] = SETTINGS_VERSION
     save_settings(data)
+    if last_settings is not None:
+        project_data = load_project_settings(project_dir)
+        if not isinstance(project_data, dict):
+            project_data = {}
+        project_data["version"] = SETTINGS_VERSION
+        project_data["last_settings"] = last_settings
+        save_project_settings(project_data, project_dir=project_dir)
 
 
 def sanitize_name(name):
@@ -317,6 +460,50 @@ def sanitize_name(name):
     return result or "untitled"
 
 
+def get_sp_name(obj):
+    if obj is None:
+        return ""
+    try:
+        value = getattr(obj, "name", None)
+        if value is not None and not callable(value):
+            return str(value)
+    except Exception:
+        pass
+    try:
+        name_fn = getattr(obj, "name", None)
+        if callable(name_fn):
+            return str(name_fn())
+    except Exception:
+        pass
+    return ""
+
+
+def get_all_texture_sets():
+    try:
+        attr = getattr(sp.textureset, "all_texture_sets", None)
+        if callable(attr):
+            return list(attr())
+        if attr is None:
+            return []
+        return list(attr)
+    except Exception:
+        return []
+
+
+def get_all_stacks(texset):
+    if not texset:
+        return []
+    try:
+        attr = getattr(texset, "all_stacks", None)
+        if callable(attr):
+            return list(attr())
+        if attr is None:
+            return []
+        return list(attr)
+    except Exception:
+        return []
+
+
 def get_bridge_root():
     env_path = os.environ.get(BRIDGE_ENV_VAR)
     if env_path:
@@ -329,7 +516,7 @@ def get_bridge_root():
 
 def get_project_name():
     try:
-        name = sp.project.name()
+        name = get_sp_name(sp.project)
     except Exception:
         name = ""
     if not name:
@@ -338,32 +525,734 @@ def get_project_name():
 
 
 def get_project_dir():
-    return get_bridge_root() / get_project_name()
+    base_dir = get_bridge_root() / get_project_name()
+    sp_project_file = ""
+    try:
+        if sp.project.is_open():
+            sp_project_file = get_sp_project_file_path_or_temp()
+    except Exception:
+        sp_project_file = ""
+    return resolve_project_dir_for_sp(sp_project_file, base_dir)
 
 
-def active_sp_info_path():
-    return get_bridge_root() / ACTIVE_SP_INFO_FILENAME
+def get_sp_project_file_path():
+    candidates = (
+        "file_path",
+        "filePath",
+        "project_file_path",
+        "project_file",
+        "projectFile",
+        "project_filepath",
+        "projectFilePath",
+        "projectPath",
+        "project_path",
+        "filepath",
+        "path",
+    )
+    for name in candidates:
+        attr = getattr(sp.project, name, None)
+        if attr is None:
+            continue
+        try:
+            value = attr() if callable(attr) else attr
+        except Exception:
+            continue
+        if value:
+            return str(value)
+    return ""
+
+
+def temp_session_id():
+    global _temp_session_id
+    if _temp_session_id is None:
+        _temp_session_id = f"{os.getpid()}_{int(time.time())}"
+    return _temp_session_id
+
+
+def bridge_temp_dir():
+    return get_bridge_root() / TEMP_DIRNAME
+
+
+def ensure_placeholder_file(path):
+    if not path:
+        return
+    try:
+        path = Path(path)
+    except Exception:
+        return
+    try:
+        ensure_dir(path.parent)
+        path.touch(exist_ok=True)
+    except OSError:
+        return
+
+
+def temp_sp_project_file_path():
+    global _temp_sp_project_file
+    if _temp_sp_project_file:
+        return _temp_sp_project_file
+    temp_dir = bridge_temp_dir()
+    filename = f"{TEMP_SP_PREFIX}{temp_session_id()}{TEMP_SP_SUFFIX}"
+    temp_path = temp_dir / filename
+    ensure_placeholder_file(temp_path)
+    _temp_sp_project_file = str(temp_path)
+    return _temp_sp_project_file
+
+
+def temp_blender_file_path():
+    global _temp_blender_file
+    if _temp_blender_file:
+        return _temp_blender_file
+    temp_dir = bridge_temp_dir()
+    filename = f"{TEMP_BLENDER_PREFIX}{temp_session_id()}{TEMP_BLENDER_SUFFIX}"
+    temp_path = temp_dir / filename
+    ensure_placeholder_file(temp_path)
+    _temp_blender_file = str(temp_path)
+    return _temp_blender_file
+
+
+def get_sp_project_file_path_or_temp():
+    sp_path = get_sp_project_file_path()
+    if sp_path:
+        return sp_path
+    return temp_sp_project_file_path()
+
+
+def is_temp_file(path, prefix, suffix):
+    if not path:
+        return False
+    try:
+        path_obj = Path(path)
+    except Exception:
+        return False
+    name = path_obj.name.lower()
+    if not (name.startswith(prefix) and name.endswith(suffix)):
+        return False
+    try:
+        return normalize_path(path_obj.parent).lower() == normalize_path(bridge_temp_dir()).lower()
+    except Exception:
+        return False
+
+
+def is_temp_sp_project_file(path):
+    return is_temp_file(path, TEMP_SP_PREFIX, TEMP_SP_SUFFIX)
+
+
+def is_temp_blender_file(path):
+    return is_temp_file(path, TEMP_BLENDER_PREFIX, TEMP_BLENDER_SUFFIX)
+
+
+def project_meta_dir(project_dir):
+    return Path(project_dir) / PROJECT_META_DIRNAME
+
+
+def project_dir_cache_key(sp_project_file):
+    if not sp_project_file:
+        return ""
+    return normalize_path_key(sp_project_file)
+
+
+def cached_project_dir(sp_project_file):
+    key = project_dir_cache_key(sp_project_file)
+    if not key:
+        return None
+    cached = _project_dir_cache.get(key)
+    return Path(cached) if cached else None
+
+
+def set_cached_project_dir(sp_project_file, project_dir):
+    key = project_dir_cache_key(sp_project_file)
+    if not key or not project_dir:
+        return
+    _project_dir_cache[key] = str(project_dir)
+
+
+def manifest_matches_sp_project_file(manifest, sp_project_file):
+    if not manifest or not sp_project_file:
+        return False
+    manifest_sp = manifest.get("sp_project_file") or manifest.get("sp_project_path")
+    return bool(manifest_sp and paths_match(manifest_sp, sp_project_file))
+
+
+def resolve_project_dir_for_sp(sp_project_file, base_dir):
+    cached = cached_project_dir(sp_project_file)
+    if cached:
+        return cached
+    if sp_project_file and base_dir.exists():
+        manifest_path = find_project_manifest_path(base_dir)
+        manifest = read_manifest(manifest_path) if manifest_path and manifest_path.exists() else None
+        if manifest_matches_sp_project_file(manifest, sp_project_file):
+            set_cached_project_dir(sp_project_file, base_dir)
+            return base_dir
+    if sp_project_file:
+        manifest_path = find_manifest_for_sp_project(
+            get_candidate_bridge_roots(),
+            sp_project_file,
+        )
+        if manifest_path:
+            project_dir = project_dir_from_manifest_path(manifest_path)
+            set_cached_project_dir(sp_project_file, project_dir)
+            return project_dir
+        project_dir = unique_project_dir(base_dir, sp_project_file)
+        set_cached_project_dir(sp_project_file, project_dir)
+        return project_dir
+    return base_dir
+
+
+def unique_project_dir(base_dir, sp_project_file):
+    if not base_dir.exists():
+        return base_dir
+    if sp_project_file:
+        manifest_path = find_project_manifest_path(base_dir)
+        manifest = read_manifest(manifest_path) if manifest_path and manifest_path.exists() else None
+        if manifest_matches_sp_project_file(manifest, sp_project_file):
+            return base_dir
+    root = base_dir.parent
+    base_name = base_dir.name
+    index = 1
+    while True:
+        candidate = root / f"{base_name}{index}"
+        if candidate.exists():
+            if sp_project_file:
+                manifest_path = find_project_manifest_path(candidate)
+                manifest = read_manifest(manifest_path) if manifest_path and manifest_path.exists() else None
+                if manifest_matches_sp_project_file(manifest, sp_project_file):
+                    return candidate
+            index += 1
+            continue
+        return candidate
+
+
+def project_dir_for_send(sp_project_file):
+    base_dir = get_bridge_root() / get_project_name()
+    if sp_project_file:
+        cached = cached_project_dir(sp_project_file)
+        if cached:
+            return cached
+        manifest_path = find_manifest_for_sp_project(
+            get_candidate_bridge_roots(),
+            sp_project_file,
+        )
+        if manifest_path:
+            project_dir = project_dir_from_manifest_path(manifest_path)
+            set_cached_project_dir(sp_project_file, project_dir)
+            return project_dir
+    project_dir = unique_project_dir(base_dir, sp_project_file)
+    if sp_project_file:
+        set_cached_project_dir(sp_project_file, project_dir)
+    return project_dir
+
+
+def normalize_normal_map_format(value):
+    if value is None:
+        return None
+    text = str(value).lower()
+    if "directx" in text or "d3d" in text or text == "dx":
+        return "directx"
+    if "opengl" in text or "ogl" in text or text == "gl":
+        return "opengl"
+    return None
+
+
+def get_sp_normal_map_format():
+    candidates = ("normal_map_format", "normalMapFormat", "normal_format", "normalFormat")
+    containers = [sp.project]
+    for name in (
+        "project_settings",
+        "projectSettings",
+        "settings",
+        "get_project_settings",
+        "getProjectSettings",
+        "get_settings",
+        "getSettings",
+    ):
+        attr = getattr(sp.project, name, None)
+        if attr is None:
+            continue
+        try:
+            value = attr() if callable(attr) else attr
+        except Exception:
+            continue
+        if value is not None:
+            containers.append(value)
+    for container in containers:
+        for name in candidates:
+            attr = getattr(container, name, None)
+            if attr is None:
+                continue
+            try:
+                value = attr() if callable(attr) else attr
+            except Exception:
+                continue
+            normalized = normalize_normal_map_format(value)
+            if normalized:
+                return normalized
+    return None
+
+
+def normalize_path(path):
+    if not path:
+        return ""
+    try:
+        return os.path.abspath(os.path.expanduser(str(path)))
+    except Exception:
+        return str(path)
+
+
+def normalize_path_key(path):
+    return normalize_path(path).lower()
+
+
+def link_registry_paths():
+    roots = []
+    docs_root = documents_bridge_root()
+    if docs_root:
+        roots.append(Path(docs_root))
+    for root in get_candidate_bridge_roots():
+        if not root:
+            continue
+        try:
+            root_path = Path(root)
+        except TypeError:
+            continue
+        if root_path.exists():
+            roots.append(root_path)
+    unique = []
+    seen = set()
+    for root in roots:
+        key = str(root).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(root)
+    return [root / LINKS_FILENAME for root in unique]
+
+
+def load_link_registry():
+    for path in link_registry_paths():
+        if not path or not path.exists():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict):
+            return data
+    return {}
+
+
+def save_link_registry(data):
+    paths = link_registry_paths()
+    if not paths:
+        return
+    primary = paths[0]
+    ensure_dir(primary.parent)
+    try:
+        with open(primary, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=True)
+    except OSError:
+        return
+    for path in paths[1:]:
+        if not path.exists():
+            continue
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2, ensure_ascii=True)
+        except OSError:
+            continue
+
+
+def update_link_registry(sp_project_file=None, blender_file=None, update_blender_link=True):
+    if not sp_project_file or not blender_file:
+        return
+    data = load_link_registry()
+    sp_key = normalize_path_key(sp_project_file)
+    bl_key = normalize_path_key(blender_file)
+    sp_map = data.get("sp_to_blender")
+    if not isinstance(sp_map, dict):
+        sp_map = {}
+    bl_map = data.get("blender_to_sp")
+    if not isinstance(bl_map, dict):
+        bl_map = {}
+    sp_map[sp_key] = str(blender_file)
+    if update_blender_link:
+        bl_map[bl_key] = str(sp_project_file)
+    data["sp_to_blender"] = sp_map
+    data["blender_to_sp"] = bl_map
+    save_link_registry(data)
+
+
+def is_force_new_project_dir(project_dir):
+    if not project_dir:
+        return False
+    manifest_path = find_project_manifest_path(project_dir)
+    if not manifest_path or not manifest_path.exists():
+        return False
+    manifest = read_manifest(manifest_path)
+    return bool(isinstance(manifest, dict) and manifest.get("force_new_project"))
+
+
+def paths_match(left, right):
+    if not left or not right:
+        return False
+    return normalize_path(left).lower() == normalize_path(right).lower()
+
+
+def find_manifest_for_sp_project(bridge_roots, sp_project_file, source=None):
+    if not sp_project_file:
+        return None
+    best_path = None
+    best_time = -1.0
+    for root in bridge_roots:
+        if not root or not root.exists():
+            continue
+        for candidate in root.rglob(MANIFEST_FILENAME):
+            try:
+                mtime = candidate.stat().st_mtime
+            except OSError:
+                continue
+            manifest = read_manifest(candidate)
+            if not manifest:
+                continue
+            if source and manifest.get("source") != source:
+                continue
+            manifest_sp = manifest.get("sp_project_file") or manifest.get("sp_project_path")
+            if not manifest_sp or not paths_match(manifest_sp, sp_project_file):
+                continue
+            if mtime > best_time:
+                best_time = mtime
+                best_path = candidate
+    return best_path
+
+
+def find_mesh_in_roots(bridge_roots, project_name, filename):
+    if not project_name or not filename:
+        return None
+    for root in bridge_roots:
+        if not root:
+            continue
+        candidate = Path(root) / project_name / filename
+        try:
+            if candidate.is_file():
+                return str(candidate)
+        except OSError:
+            continue
+    return None
+
+
+def read_linked_blender_file(project_dir):
+    blender_file = ""
+    sp_project_file = get_sp_project_file_path_or_temp()
+    if sp_project_file:
+        registry = load_link_registry()
+        blender_file = registry.get("sp_to_blender", {}).get(
+            normalize_path_key(sp_project_file)
+        )
+        if blender_file:
+            return str(blender_file)
+        manifest_path = find_manifest_for_sp_project(
+            get_candidate_bridge_roots(),
+            sp_project_file,
+        )
+        if manifest_path:
+            manifest = read_manifest(manifest_path)
+            if manifest:
+                blender_file = manifest.get("blender_file") or ""
+                if blender_file:
+                    return str(blender_file)
+    if project_dir:
+        manifest_path = find_project_manifest_path(project_dir)
+        if manifest_path and manifest_path.exists():
+            manifest = read_manifest(manifest_path)
+            if manifest:
+                manifest_sp = manifest.get("sp_project_file") or manifest.get("sp_project_path")
+                if manifest_sp and sp_project_file and not paths_match(manifest_sp, sp_project_file):
+                    pass
+                else:
+                    blender_file = manifest.get("blender_file") or ""
+                    if blender_file:
+                        return str(blender_file)
+        project_data = load_project_settings(project_dir)
+        if isinstance(project_data, dict):
+            blender_file = project_data.get("linked_blender_file") or ""
+            if blender_file:
+                return str(blender_file)
+    return ""
+
+
+def resolve_primary_sp_project_for_blender(blender_file, current_sp_project_file):
+    if not blender_file:
+        return ""
+    registry = load_link_registry()
+    candidate = registry.get("blender_to_sp", {}).get(normalize_path_key(blender_file))
+    if not candidate:
+        return ""
+    if current_sp_project_file and paths_match(candidate, current_sp_project_file):
+        return ""
+    return str(candidate)
+
+
+def update_manifest_sp_project_file(old_sp_project_file, new_sp_project_file):
+    if not old_sp_project_file or not new_sp_project_file:
+        return
+    manifest_path = find_manifest_for_sp_project(
+        get_candidate_bridge_roots(),
+        old_sp_project_file,
+    )
+    if not manifest_path:
+        return
+    manifest = read_manifest(manifest_path)
+    if not isinstance(manifest, dict):
+        return
+    manifest["sp_project_file"] = str(new_sp_project_file)
+    project_dir = project_dir_from_manifest_path(manifest_path)
+    target_path = project_manifest_path(project_dir)
+    if target_path:
+        ensure_dir(target_path.parent)
+        write_manifest(target_path, manifest)
+
+
+def write_manifest_sp_project_file(manifest, project_dir, sp_project_file):
+    if not isinstance(manifest, dict) or not project_dir or not sp_project_file:
+        return
+    manifest["sp_project_file"] = str(sp_project_file)
+    target_path = project_manifest_path(project_dir)
+    if not target_path:
+        return
+    ensure_dir(target_path.parent)
+    write_manifest(target_path, manifest)
+
+
+def sync_saved_sp_project_file():
+    global _last_sp_project_file
+    if not sp.project.is_open():
+        _last_sp_project_file = None
+        return
+    current_real = get_sp_project_file_path()
+    current = current_real or temp_sp_project_file_path()
+    if _last_sp_project_file and current_real and not paths_match(current_real, _last_sp_project_file):
+        project_dir = get_project_dir()
+        linked_blender_file = read_linked_blender_file(project_dir)
+        force_new = is_force_new_project_dir(project_dir)
+        if linked_blender_file:
+            update_link_registry(
+                sp_project_file=current_real,
+                blender_file=linked_blender_file,
+                update_blender_link=not force_new,
+            )
+        update_manifest_sp_project_file(_last_sp_project_file, current_real)
+        set_cached_project_dir(current_real, get_project_dir())
+    _last_sp_project_file = current
+
+
+def find_blender_exe():
+    for env_var in ("BLENDER_EXE", "BLENDER_EXECUTABLE", "BLENDER_PATH"):
+        env_path = os.environ.get(env_var)
+        if not env_path:
+            continue
+        env_candidate = Path(env_path).expanduser()
+        if env_candidate.is_file():
+            return str(env_candidate)
+        if sys.platform == "darwin" and env_candidate.suffix.lower() == ".app" and env_candidate.is_dir():
+            return str(env_candidate)
+
+    if os.name == "nt":
+        program_files = os.environ.get("ProgramFiles", r"C:\\Program Files")
+        program_files_x86 = os.environ.get("ProgramFiles(x86)")
+        for base in (program_files, program_files_x86):
+            if not base:
+                continue
+            base_path = Path(base) / "Blender Foundation"
+            if not base_path.exists():
+                continue
+            direct = base_path / "Blender" / "blender.exe"
+            if direct.is_file():
+                return str(direct)
+            for candidate in sorted(base_path.glob("Blender*/blender.exe"), reverse=True):
+                if candidate.is_file():
+                    return str(candidate)
+    elif sys.platform == "darwin":
+        app_candidates = [
+            Path("/Applications/Blender.app"),
+            Path.home() / "Applications" / "Blender.app",
+        ]
+        for candidate in app_candidates:
+            if candidate.is_dir():
+                return str(candidate)
+        for root in (Path("/Applications"), Path.home() / "Applications"):
+            if not root.exists():
+                continue
+            for app in sorted(root.glob("Blender*.app")):
+                if app.is_dir():
+                    return str(app)
+    else:
+        blender_bin = shutil.which("blender")
+        if blender_bin:
+            return blender_bin
+    return ""
+
+
+def open_linked_blender_file(path, project_dir=None):
+    if not path:
+        return False
+    if blender_project_is_open(path, project_dir=project_dir):
+        return True
+    blender_exe = find_blender_exe()
+    try:
+        if sys.platform == "darwin":
+            if blender_exe:
+                if blender_exe.lower().endswith(".app") and Path(blender_exe).is_dir():
+                    subprocess.Popen(["open", "-a", blender_exe, str(path)])
+                    return True
+                if Path(blender_exe).is_file():
+                    subprocess.Popen([blender_exe, str(path)])
+                    return True
+            subprocess.Popen(["open", str(path)])
+            return True
+        if os.name == "nt":
+            if blender_exe and Path(blender_exe).is_file():
+                subprocess.Popen([blender_exe, str(path)])
+                return True
+            if hasattr(os, "startfile"):
+                os.startfile(str(path))
+                return True
+            subprocess.Popen(["cmd", "/c", "start", "", str(path)])
+            return True
+        if blender_exe and Path(blender_exe).is_file():
+            subprocess.Popen([blender_exe, str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+        return True
+    except Exception:
+        try:
+            return QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+        except Exception:
+            return False
+
+
+def active_sp_info_paths(project_dir=None):
+    paths = [get_bridge_root() / ACTIVE_SP_INFO_FILENAME]
+    docs_root = documents_bridge_root()
+    if docs_root:
+        paths.append(Path(docs_root) / ACTIVE_SP_INFO_FILENAME)
+    if project_dir:
+        paths.append(project_meta_dir(project_dir) / ACTIVE_SP_INFO_FILENAME)
+    unique = []
+    seen = set()
+    for path in paths:
+        key = str(path).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
 
 
 def write_active_sp_info():
+    try:
+        sync_saved_sp_project_file()
+    except Exception:
+        pass
     info = {
         "timestamp": time.time(),
         "project_open": False,
     }
+    project_dir = None
     try:
         if sp.project.is_open():
             info["project_open"] = True
             info["project_name"] = get_project_name()
-            info["project_dir"] = str(get_project_dir())
+            project_dir = get_project_dir()
+            info["project_dir"] = str(project_dir)
+            sp_project_file = get_sp_project_file_path_or_temp()
+            if sp_project_file:
+                info["sp_project_file"] = sp_project_file
+            blender_file = read_linked_blender_file(project_dir)
+            if blender_file:
+                info["blender_file"] = blender_file
     except Exception:
         pass
-    path = active_sp_info_path()
-    ensure_dir(path.parent)
+    for path in active_sp_info_paths(project_dir):
+        ensure_dir(path.parent)
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(info, handle, indent=2, ensure_ascii=True)
+        except OSError:
+            continue
+
+
+def active_blender_info_paths(project_dir=None):
+    paths = [get_bridge_root() / ACTIVE_BLENDER_INFO_FILENAME]
+    docs_root = documents_bridge_root()
+    if docs_root:
+        paths.append(Path(docs_root) / ACTIVE_BLENDER_INFO_FILENAME)
+    if project_dir:
+        paths.append(project_meta_dir(project_dir) / ACTIVE_BLENDER_INFO_FILENAME)
+    unique = []
+    seen = set()
+    for path in paths:
+        key = str(path).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def read_active_blender_info(path):
     try:
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(info, handle, indent=2, ensure_ascii=True)
-    except OSError:
-        return
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    timestamp = data.get("timestamp")
+    try:
+        timestamp = float(timestamp)
+    except (TypeError, ValueError):
+        timestamp = 0.0
+    if not timestamp:
+        try:
+            timestamp = Path(path).stat().st_mtime
+        except OSError:
+            timestamp = 0.0
+    return {
+        "timestamp": timestamp,
+        "blender_file": data.get("blender_file"),
+        "project_dir": data.get("project_dir"),
+        "project_name": data.get("project_name"),
+    }
+
+
+def find_active_blender_info(project_dir=None, max_age=ACTIVE_BLENDER_INFO_MAX_AGE):
+    now = time.time()
+    best = None
+    best_time = 0.0
+    for path in active_blender_info_paths(project_dir):
+        if not path.exists():
+            continue
+        info = read_active_blender_info(path)
+        if not info:
+            continue
+        ts = info.get("timestamp", 0.0) or 0.0
+        if max_age and ts and now - ts > max_age:
+            continue
+        if ts > best_time:
+            best_time = ts
+            best = info
+    return best
+
+
+def blender_project_is_open(path, project_dir=None):
+    if not path:
+        return False
+    info = find_active_blender_info(project_dir)
+    if not info:
+        return False
+    active_path = info.get("blender_file") or ""
+    return bool(active_path and paths_match(active_path, path))
 
 
 def ensure_dir(path):
@@ -782,7 +1671,8 @@ def show_warning_dialog(title, summary, details=None):
 
 def append_log(project_dir, message, data=None):
     try:
-        log_path = Path(project_dir) / LOG_FILENAME
+        log_path = project_meta_dir(project_dir) / LOG_FILENAME
+        ensure_dir(log_path.parent)
         with open(log_path, "a", encoding="utf-8") as handle:
             handle.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
             if data is not None:
@@ -802,7 +1692,7 @@ def apply_high_poly_mesh(high_path):
     try:
         import substance_painter.baking as baking
         hipoly = high_poly_url(high_path)
-        texsets = list(sp.textureset.all_texture_sets())
+        texsets = list(get_all_texture_sets())
         if not texsets:
             return False
         applied = 0
@@ -812,6 +1702,25 @@ def apply_high_poly_mesh(high_path):
             hipoly_prop = common.get("HipolyMesh")
             if hipoly_prop:
                 baking.BakingParameters.set({hipoly_prop: hipoly})
+                applied += 1
+        return applied > 0
+    except Exception:
+        return False
+
+
+def clear_high_poly_mesh():
+    try:
+        import substance_painter.baking as baking
+        texsets = list(get_all_texture_sets())
+        if not texsets:
+            return False
+        applied = 0
+        for texset in texsets:
+            params = baking.BakingParameters.from_texture_set(texset)
+            common = params.common()
+            hipoly_prop = common.get("HipolyMesh")
+            if hipoly_prop:
+                baking.BakingParameters.set({hipoly_prop: ""})
                 applied += 1
         return applied > 0
     except Exception:
@@ -880,6 +1789,19 @@ def apply_high_poly_when_ready(high_path):
         sp_event.DISPATCHER.disconnect(sp_event.ProjectEditionEntered, _on_enter)
         if not apply_high_poly_mesh(high_path):
             _queue_high_poly_retry(high_path)
+
+    sp_event.DISPATCHER.connect(sp_event.ProjectEditionEntered, _on_enter)
+
+
+def clear_high_poly_when_ready():
+    _stop_high_poly_retry()
+    if sp.project.is_open() and sp.project.is_in_edition_state():
+        clear_high_poly_mesh()
+        return
+
+    def _on_enter(_event):
+        sp_event.DISPATCHER.disconnect(sp_event.ProjectEditionEntered, _on_enter)
+        clear_high_poly_mesh()
 
     sp_event.DISPATCHER.connect(sp_event.ProjectEditionEntered, _on_enter)
 
@@ -985,19 +1907,21 @@ def pick_export_preset():
 
 def build_export_list(output_maps=None):
     export_list = []
-    for texset in sp.textureset.all_texture_sets():
-        stacks = texset.all_stacks()
+    for texset in get_all_texture_sets():
+        stacks = get_all_stacks(texset)
         if stacks:
             for stack in stacks:
-                root = texset.name()
-                if stack.name():
-                    root = f"{root}/{stack.name()}"
+                texset_name = get_sp_name(texset)
+                stack_name = get_sp_name(stack)
+                root = texset_name
+                if stack_name:
+                    root = f"{root}/{stack_name}"
                 entry = {"rootPath": root}
                 if output_maps:
                     entry["filter"] = {"outputMaps": output_maps}
                 export_list.append(entry)
         else:
-            entry = {"rootPath": texset.name()}
+            entry = {"rootPath": get_sp_name(texset)}
             if output_maps:
                 entry["filter"] = {"outputMaps": output_maps}
             export_list.append(entry)
@@ -1090,7 +2014,7 @@ def extract_output_map_names(maps):
 
 def get_stack_for_textureset(texset, stack_name):
     try:
-        return sp.textureset.Stack.from_name(texset.name(), stack_name)
+        return sp.textureset.Stack.from_name(get_sp_name(texset), stack_name)
     except Exception:
         return None
 
@@ -1132,8 +2056,8 @@ def get_output_map_definitions(preset_info, stack=None):
                         target_stack = sp.textureset.get_active_stack()
                     if not target_stack:
                         stacks = []
-                        for texset in sp.textureset.all_texture_sets():
-                            stacks.extend(texset.all_stacks())
+                        for texset in get_all_texture_sets():
+                            stacks.extend(get_all_stacks(texset))
                         target_stack = stacks[0] if stacks else None
                     if not target_stack:
                         return []
@@ -1153,9 +2077,71 @@ def normalize_map_key(value):
     return re.sub(r"[^a-z0-9]", "", str(value).lower())
 
 
+BASECOLOR_HINTS = (
+    "basecolor",
+    "base_color",
+    "basecol",
+    "basec",
+    "basecolour",
+    "base_map",
+    "basemap",
+    "albedo",
+    "diffuse",
+    "color",
+)
+OPACITY_HINTS = ("opacity", "alpha", "transparency", "transparent", "cutout")
+
+
+def map_name_is_basecolor(map_name):
+    key = normalize_map_key(map_name)
+    if not key:
+        return False
+    for hint in BASECOLOR_HINTS:
+        if hint in key:
+            return True
+    return False
+
+
+def map_def_has_opacity_channel(map_def):
+    channels = map_def.get("channels") or []
+    for channel in channels:
+        name = str(channel.get("srcMapName") or "")
+        if not name:
+            continue
+        key = normalize_map_key(name)
+        if key in OPACITY_HINTS:
+            return True
+        lower = name.lower()
+        if any(hint in lower for hint in OPACITY_HINTS):
+            return True
+    return False
+
+
+def preset_basecolor_has_opacity(preset_info, stacks=None):
+    map_defs = []
+    if preset_info:
+        stack = stacks[0] if stacks else None
+        map_defs = get_output_map_definitions(preset_info, stack=stack)
+    for map_def in map_defs:
+        if isinstance(map_def, str):
+            continue
+        map_dict = map_def_to_dict(map_def)
+        if not map_dict:
+            continue
+        file_name = map_dict.get("fileName") or map_dict.get("file_name") or ""
+        if not map_name_is_basecolor(file_name):
+            continue
+        if map_def_has_opacity_channel(map_dict):
+            return True
+    return False
+
+
 DOC_MAP_TO_CHANNELS = {
     "basecolor": ["BaseColor", "Diffuse", "Color"],
     "base_color": ["BaseColor", "Diffuse", "Color"],
+    "basemap": ["BaseColor", "Diffuse", "Color"],
+    "base map": ["BaseColor", "Diffuse", "Color"],
+    "base": ["BaseColor", "Diffuse", "Color"],
     "albedo": ["BaseColor", "Diffuse", "Color"],
     "diffuse": ["Diffuse", "BaseColor", "Color"],
     "color": ["Color", "BaseColor", "Diffuse"],
@@ -1213,6 +2199,12 @@ def resolve_channel_names(doc_map_name):
 def stack_has_doc_map(stack, doc_map_name):
     if not doc_map_name:
         return True
+    key = normalize_map_key(doc_map_name)
+    if key in {"diffuse", "diffusecolor"}:
+        return (
+            stack_has_channel_type(stack, "Diffuse")
+            or stack_has_channel_type(stack, "DiffuseColor")
+        )
     lookup = resolve_channel_names(doc_map_name)
     if not lookup:
         return True
@@ -1247,7 +2239,7 @@ def get_required_map_groups(map_def):
 
 def collect_selected_stacks(selected_texture_sets=None, stack_roots=None):
     roots = stack_roots if stack_roots is not None else collect_stack_roots(selected_texture_sets)
-    return [stack for _root, stack in roots]
+    return [stack for _, stack in roots]
 
 
 def collect_stack_roots(selected_texture_sets=None):
@@ -1255,11 +2247,11 @@ def collect_stack_roots(selected_texture_sets=None):
     selected_sets = None
     if selected_texture_sets:
         selected_sets = {name.lower() for name in selected_texture_sets if name}
-    for texset in sp.textureset.all_texture_sets():
-        texset_name = texset.name()
+    for texset in get_all_texture_sets():
+        texset_name = get_sp_name(texset)
         if selected_sets and texset_name.lower() not in selected_sets:
             continue
-        tex_stacks = texset.all_stacks()
+        tex_stacks = get_all_stacks(texset)
         if not tex_stacks:
             stack = get_stack_for_textureset(texset, "")
             tex_stacks = [stack] if stack else []
@@ -1267,10 +2259,7 @@ def collect_stack_roots(selected_texture_sets=None):
             if not stack:
                 continue
             root = texset_name
-            try:
-                stack_name = stack.name()
-            except Exception:
-                stack_name = ""
+            stack_name = get_sp_name(stack)
             if stack_name:
                 root = f"{texset_name}/{stack_name}"
             roots.append((root, stack))
@@ -1359,7 +2348,7 @@ def auto_enable_missing_channels(missing_by_map, selected_texture_sets=None, sta
     roots = stack_roots if stack_roots is not None else collect_stack_roots(selected_texture_sets)
     stack_lookup = {root: stack for root, stack in roots}
     enabled = {}
-    for _map_name, root_info in missing_by_map.items():
+    for _, root_info in missing_by_map.items():
         for root, missing in root_info.items():
             stack = stack_lookup.get(root)
             if not stack:
@@ -1389,6 +2378,174 @@ def channel_available_any_stack(channel, stacks):
         if channel_is_available(stack, channel):
             return True
     return False
+
+
+def channel_available_all_stacks(channel, stacks):
+    if not stacks:
+        return True
+    for stack in stacks:
+        if not channel_is_available(stack, channel):
+            return False
+    return True
+
+
+def stack_has_channel_type(stack, channel_name):
+    if not stack or not channel_name:
+        return False
+    channel_type = sp.textureset.ChannelType.__members__.get(channel_name)
+    if not channel_type:
+        return False
+    try:
+        return bool(stack.has_channel(channel_type))
+    except Exception:
+        return False
+
+
+def stacks_have_channel(stacks, channel_name):
+    if not stacks:
+        return False
+    for stack in stacks:
+        if stack_has_channel_type(stack, channel_name):
+            return True
+    return False
+
+
+def channel_is_opacity(channel):
+    if not channel:
+        return False
+    name = str(channel.get("srcMapName") or "")
+    if not name:
+        return False
+    key = normalize_map_key(name)
+    if key in OPACITY_HINTS:
+        return True
+    lower = name.lower()
+    return any(hint in lower for hint in OPACITY_HINTS)
+
+
+def channel_is_diffuse(channel):
+    if not channel:
+        return False
+    name = str(channel.get("srcMapName") or "")
+    if not name:
+        return False
+    key = normalize_map_key(name)
+    return key in {"diffuse", "diffusecolor"}
+
+
+def _strip_output_prefix(map_name):
+    label = str(map_name or "")
+    for prefix in ("$textureSet_", "$mesh_", "$sceneMaterial_"):
+        if label.lower().startswith(prefix.lower()):
+            label = label[len(prefix):]
+            break
+    return label
+
+
+def _packed_doc_channels(pairs):
+    channels = []
+    for dest, src in pairs:
+        channels.append({
+            "destChannel": dest,
+            "srcChannel": "L",
+            "srcMapType": "documentMap",
+            "srcMapName": src,
+        })
+    return channels
+
+
+def _auto_map_type(map_name):
+    label = _strip_output_prefix(map_name)
+    key = normalize_map_key(label)
+    if not key:
+        return None
+    if "occlusionroughnessmetallic" in key or "orm" in key or "arm" in key:
+        return "orm"
+    if "materialparams" in key or "materialparam" in key or "maskmap" in key:
+        return "orm"
+    if "normal" in key:
+        return "normal"
+    if "roughness" in key:
+        return "roughness"
+    if "gloss" in key or "smoothness" in key:
+        return "glossiness"
+    if "metallic" in key or "metalness" in key or "metal" == key:
+        return "metallic"
+    if "specular" in key or "reflection" in key:
+        return "specular"
+    if "height" in key or "displacement" in key:
+        return "height"
+    if "emissive" in key or "emission" in key:
+        return "emission"
+    if any(hint in key for hint in OPACITY_HINTS):
+        return "opacity"
+    if map_name_is_basecolor(label) or key in {"base", "color", "diffuse", "diffusecolor", "albedo"}:
+        return "basecolor"
+    if "occlusion" in key or key == "ao":
+        return "ao"
+    return None
+
+
+def _auto_map_definition(map_name):
+    map_type = _auto_map_type(map_name)
+    if not map_type:
+        return None
+    if map_type == "orm":
+        channels = _packed_doc_channels([
+            ("R", "ambientocclusion"),
+            ("G", "roughness"),
+            ("B", "metallic"),
+        ])
+    elif map_type == "basecolor":
+        channels = _rgb_channels("documentMap", "basecolor")
+    elif map_type == "normal":
+        channels = _rgb_channels("documentMap", "normal")
+    elif map_type == "emission":
+        channels = _rgb_channels("documentMap", "emissive")
+    elif map_type == "ao":
+        channels = _gray_channels("documentMap", "ambientocclusion")
+    elif map_type == "height":
+        channels = _gray_channels("documentMap", "height")
+    elif map_type == "glossiness":
+        channels = _gray_channels("documentMap", "glossiness")
+    elif map_type == "specular":
+        channels = _gray_channels("documentMap", "specular")
+    elif map_type == "opacity":
+        channels = _gray_channels("documentMap", "opacity")
+    else:
+        channels = _gray_channels("documentMap", map_type)
+    return {
+        "fileName": str(map_name),
+        "channels": channels,
+    }
+
+
+def _map_def_has_channels(map_def):
+    if isinstance(map_def, dict):
+        return bool(map_def.get("channels"))
+    channels = getattr(map_def, "channels", None)
+    if channels is None:
+        return False
+    try:
+        return bool(list(channels))
+    except TypeError:
+        return bool(channels)
+
+
+def _should_force_basecolor_for_diffuse(map_names, stacks):
+    if not map_names or not stacks:
+        return False
+    wants_diffuse = False
+    for name in map_names:
+        key = normalize_map_key(name)
+        if "diffuse" in key:
+            wants_diffuse = True
+            break
+    if not wants_diffuse:
+        return False
+    if stacks_have_channel(stacks, "Diffuse"):
+        return False
+    return stacks_have_channel(stacks, "BaseColor")
 
 
 def channel_to_dict(channel):
@@ -1451,22 +2608,58 @@ def sanitize_map_definitions(preset_info, selected_texture_sets=None, stacks=Non
     if not map_defs:
         return None, False, {}
     stacks = stacks if stacks is not None else collect_selected_stacks(selected_texture_sets)
+    map_names = extract_output_map_names(map_defs)
+    if map_defs and not any(_map_def_has_channels(item) for item in map_defs):
+        if _should_force_basecolor_for_diffuse(map_names, stacks):
+            auto_defs = []
+            for name in map_names:
+                auto_def = _auto_map_definition(name)
+                if not auto_def:
+                    auto_defs = []
+                    break
+                auto_defs.append(auto_def)
+            if auto_defs:
+                return auto_defs, True, {}
     sanitized = []
     changed = False
     removed = {}
+    basecolor_present = stacks_have_channel(stacks, "BaseColor")
+    if not basecolor_present:
+        basecolor_present = any(stack_has_doc_map(stack, "basecolor") for stack in stacks)
+    can_sub_basecolor = basecolor_present and not stacks_have_channel(stacks, "Diffuse")
     for map_def in map_defs:
         if isinstance(map_def, str):
-            sanitized.append(map_def)
+            auto_def = _auto_map_definition(map_def)
+            if auto_def:
+                sanitized.append(auto_def)
+                changed = True
+            else:
+                sanitized.append(map_def)
             continue
         map_dict = map_def_to_dict(map_def)
         if not map_dict:
             return None, False, {}
+        map_name = map_dict.get("fileName")
         channels = map_dict.get("channels")
+        if not channels:
+            auto_def = _auto_map_definition(map_name)
+            if auto_def:
+                sanitized.append(auto_def)
+                changed = True
+                continue
         if channels:
             kept = []
             removed_channels = []
             for channel in channels:
-                if channel_available_any_stack(channel, stacks):
+                if can_sub_basecolor and channel_is_diffuse(channel):
+                    channel = dict(channel)
+                    channel["srcMapName"] = "basecolor"
+                    changed = True
+                require_all = False
+                if map_name and map_name_is_basecolor(map_name) and channel_is_opacity(channel):
+                    require_all = True
+                if (channel_available_all_stacks(channel, stacks) if require_all
+                        else channel_available_any_stack(channel, stacks)):
                     kept.append(channel)
                 else:
                     name = channel.get("srcMapName")
@@ -1476,14 +2669,12 @@ def sanitize_map_definitions(preset_info, selected_texture_sets=None, stacks=Non
             if not kept:
                 changed = True
                 if removed_channels:
-                    map_name = map_dict.get("fileName")
                     if map_name:
                         removed.setdefault(map_name, set()).update(removed_channels)
                 continue
             if len(kept) != len(channels):
                 map_dict["channels"] = kept
                 if removed_channels:
-                    map_name = map_dict.get("fileName")
                     if map_name:
                         removed.setdefault(map_name, set()).update(removed_channels)
         sanitized.append(map_dict)
@@ -1527,19 +2718,21 @@ def build_export_list_for_preset(
         if selected_texture_sets:
             selected_sets = {name.lower() for name in selected_texture_sets if name}
         stack_roots = []
-        for texset in sp.textureset.all_texture_sets():
-            if selected_sets and texset.name().lower() not in selected_sets:
+        for texset in get_all_texture_sets():
+            texset_name = get_sp_name(texset)
+            if selected_sets and texset_name.lower() not in selected_sets:
                 continue
-            stacks = texset.all_stacks()
+            stacks = get_all_stacks(texset)
             if not stacks:
                 stack = get_stack_for_textureset(texset, "")
                 stacks = [stack] if stack else []
             for stack in stacks:
                 if not stack:
                     continue
-                root = texset.name()
-                if stack.name():
-                    root = f"{root}/{stack.name()}"
+                root = texset_name
+                stack_name = get_sp_name(stack)
+                if stack_name:
+                    root = f"{root}/{stack_name}"
                 stack_roots.append((root, stack))
     static_map_defs = None
     if preset_info and preset_info.get("kind") in ("custom", "resource", "user"):
@@ -1551,35 +2744,41 @@ def build_export_list_for_preset(
         if not map_defs:
             continue
         valid_maps = []
-        had_channel_info = False
+        available_maps = []
         for map_def in map_defs:
             if isinstance(map_def, dict):
                 map_name = map_def.get("fileName")
+                if map_name:
+                    available_maps.append(map_name)
                 if not map_name or map_name not in selected_map_set:
                     continue
-                if map_def.get("channels"):
-                    had_channel_info = True
                 required_doc, required_input = get_required_map_groups(map_def)
                 missing_doc = [
                     req for req in required_doc if not stack_has_doc_map(stack, req)
                 ]
-                if missing_doc:
-                    continue
                 missing_input = [
                     req for req in required_input if not stack_has_doc_map(stack, req)
                 ]
-                if missing_input:
+                if missing_doc or missing_input:
+                    if map_name_is_basecolor(map_name):
+                        valid_maps.append(map_name)
                     continue
                 valid_maps.append(map_name)
             elif isinstance(map_def, str):
+                available_maps.append(map_def)
                 if map_def in selected_map_set:
                     valid_maps.append(map_def)
             else:
                 map_name = getattr(map_def, "fileName", None) or getattr(map_def, "file_name", None)
+                if map_name:
+                    available_maps.append(map_name)
                 if map_name and map_name in selected_map_set:
                     valid_maps.append(map_name)
-        if not valid_maps and selected_output_maps and not had_channel_info:
-            valid_maps = list(selected_output_maps)
+        if not valid_maps and selected_output_maps:
+            if available_maps:
+                valid_maps = [name for name in selected_output_maps if name in available_maps]
+            if not valid_maps:
+                valid_maps = list(selected_output_maps)
         if not valid_maps:
             continue
         export_list.append({
@@ -1593,10 +2792,10 @@ def build_export_parameters(settings):
     merged = dict(DEFAULT_EXPORT_SETTINGS)
     if settings:
         merged.update(settings)
-    valid_formats = {value for value, _label in EXPORT_FORMATS}
-    valid_bit_depths = {value for value, _label in EXPORT_BIT_DEPTHS}
-    valid_resolutions = {value for value, _label in EXPORT_RESOLUTIONS}
-    valid_padding = {value for value, _label in PADDING_ALGORITHMS}
+    valid_formats = {value for value, _ in EXPORT_FORMATS}
+    valid_bit_depths = {value for value, _ in EXPORT_BIT_DEPTHS}
+    valid_resolutions = {value for value, _ in EXPORT_RESOLUTIONS}
+    valid_padding = {value for value, _ in PADDING_ALGORITHMS}
     file_format = merged.get("file_format")
     if file_format not in valid_formats:
         file_format = DEFAULT_EXPORT_SETTINGS["file_format"]
@@ -1886,9 +3085,9 @@ def ensure_uv_channel():
         stack = None
     if not stack:
         try:
-            texsets = sp.textureset.all_texture_sets()
+            texsets = get_all_texture_sets()
             if texsets:
-                stacks = texsets[0].all_stacks()
+                stacks = get_all_stacks(texsets[0])
                 stack = stacks[0] if stacks else None
         except Exception:
             stack = None
@@ -1907,6 +3106,99 @@ def ensure_uv_channel():
         return
 
 
+class _NeutralCheckedItemDelegate(QtWidgets.QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        if opt.state & QtWidgets.QStyle.State_On:
+            opt.backgroundBrush = QtGui.QBrush(QtCore.Qt.transparent)
+        super().paint(painter, opt, index)
+
+
+class _DragCheckListWidget(QtWidgets.QListWidget):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._drag_check_active = False
+        self._drag_check_state = None
+        self._drag_last_row = None
+        self._drag_start_row = None
+        self._drag_start_pos = None
+        self._drag_initial_state = None
+
+    def _reset_drag_state(self):
+        self._drag_check_active = False
+        self._drag_check_state = None
+        self._drag_last_row = None
+        self._drag_start_row = None
+        self._drag_start_pos = None
+        self._drag_initial_state = None
+
+    def _apply_drag_range(self, start_row, end_row, state):
+        if start_row is None or end_row is None:
+            return
+        if end_row < start_row:
+            start_row, end_row = end_row, start_row
+        for row in range(start_row, end_row + 1):
+            item = self.item(row)
+            if not item:
+                continue
+            if item.flags() & QtCore.Qt.ItemIsUserCheckable:
+                item.setCheckState(state)
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            item = self.itemAt(event.pos())
+            if item and (item.flags() & QtCore.Qt.ItemIsUserCheckable):
+                self._drag_start_row = self.row(item)
+                self._drag_start_pos = event.pos()
+                self._drag_initial_state = item.checkState()
+            else:
+                self._reset_drag_state()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (event.buttons() & QtCore.Qt.LeftButton) and self._drag_start_row is not None:
+            if not self._drag_check_active:
+                if self._drag_start_pos is None:
+                    self._drag_start_pos = event.pos()
+                distance = (event.pos() - self._drag_start_pos).manhattanLength()
+                if distance < QtWidgets.QApplication.startDragDistance():
+                    super().mouseMoveEvent(event)
+                    return
+                self._drag_check_active = True
+                self._drag_check_state = (
+                    QtCore.Qt.Unchecked
+                    if self._drag_initial_state == QtCore.Qt.Checked
+                    else QtCore.Qt.Checked
+                )
+                self._drag_last_row = self._drag_start_row
+                start_item = self.item(self._drag_start_row)
+                if start_item and (start_item.flags() & QtCore.Qt.ItemIsUserCheckable):
+                    start_item.setCheckState(self._drag_check_state)
+            if self._drag_check_active:
+                item = self.itemAt(event.pos())
+                if item and (item.flags() & QtCore.Qt.ItemIsUserCheckable):
+                    row = self.row(item)
+                    last_row = self._drag_last_row
+                    if last_row is None:
+                        last_row = row
+                    if row != last_row:
+                        self._apply_drag_range(last_row, row, self._drag_check_state)
+                        self._drag_last_row = row
+                    else:
+                        item.setCheckState(self._drag_check_state)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            was_drag = self._drag_check_active
+            self._reset_drag_state()
+            if was_drag:
+                event.accept()
+                return
+        super().mouseReleaseEvent(event)
+
+
 class ExportDialog(QtWidgets.QDialog):
     def __init__(self):
         super().__init__(QtWidgets.QApplication.activeWindow())
@@ -1919,7 +3211,10 @@ class ExportDialog(QtWidgets.QDialog):
         self._default_preset_options = None
         self._loading = True
 
-        state = load_persistent_state()
+        self._project_dir = get_project_dir()
+        self._linked_blender_file = read_linked_blender_file(self._project_dir)
+
+        state = load_persistent_state(self._project_dir)
         self._last_state = state.get("last_settings", {})
         self._user_presets = [
             preset for preset in state.get("user_presets", [])
@@ -1930,14 +3225,17 @@ class ExportDialog(QtWidgets.QDialog):
         self._pending_texture_sets = self._last_state.get("texture_sets")
 
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
         layout.setContentsMargins(12, 12, 12, 12)
-        self.setMinimumSize(860, 680)
-        self.resize(920, 700)
+
+        content = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content)
+        content_layout.setSpacing(10)
+        content_layout.setContentsMargins(0, 0, 0, 0)
 
         header = QtWidgets.QLabel("GoB Bridge Export")
         header.setStyleSheet("font-weight: 600; font-size: 14px;")
-        layout.addWidget(header)
+        content_layout.addWidget(header)
 
         update_bar = QtWidgets.QHBoxLayout()
         self.update_status_label = QtWidgets.QLabel()
@@ -1946,13 +3244,15 @@ class ExportDialog(QtWidgets.QDialog):
         self.update_check_btn = QtWidgets.QPushButton("Check Updates")
         self.update_download_btn = QtWidgets.QPushButton("Download")
         self.update_download_btn.setEnabled(False)
+        self.report_bug_btn = QtWidgets.QPushButton("Report Bug")
         update_bar.addWidget(self.update_status_label)
         update_bar.addStretch()
         update_bar.addWidget(self.update_check_btn)
         update_bar.addWidget(self.update_download_btn)
+        update_bar.addWidget(self.report_bug_btn)
         update_widget = QtWidgets.QWidget()
         update_widget.setLayout(update_bar)
-        layout.addWidget(update_widget)
+        content_layout.addWidget(update_widget)
 
         preset_bar = QtWidgets.QHBoxLayout()
         preset_bar.addWidget(QtWidgets.QLabel("Bridge preset"))
@@ -1962,12 +3262,32 @@ class ExportDialog(QtWidgets.QDialog):
         self.delete_preset_btn = QtWidgets.QPushButton("Delete")
         preset_bar.addWidget(self.save_preset_btn)
         preset_bar.addWidget(self.delete_preset_btn)
-        layout.addLayout(preset_bar)
+        preset_widget = QtWidgets.QWidget()
+        preset_widget.setLayout(preset_bar)
+        content_layout.addWidget(preset_widget)
+
+        self.link_group = QtWidgets.QGroupBox("Linked Blender Project")
+        link_layout = QtWidgets.QVBoxLayout(self.link_group)
+        link_layout.setContentsMargins(8, 6, 8, 6)
+        link_layout.setSpacing(4)
+        self.detected_blender_label = QtWidgets.QLabel()
+        self.detected_blender_label.setWordWrap(True)
+        self.detected_blender_label.setStyleSheet("color: #666;")
+        link_layout.addWidget(self.detected_blender_label)
+        self.open_blender_cb = QtWidgets.QCheckBox("Open linked project on export")
+        link_layout.addWidget(self.open_blender_cb)
+        self.open_temp_blender_cb = QtWidgets.QCheckBox("Allow opening temp linked project")
+        self.open_temp_blender_cb.setToolTip(
+            "Enable opening a linked unsaved Blender file from the bridge temp folder."
+        )
+        link_layout.addWidget(self.open_temp_blender_cb)
+        self.open_temp_blender_cb.toggled.connect(self._refresh_linked_blender_state)
+        content_layout.addWidget(self.link_group)
 
         self.mesh_group = QtWidgets.QGroupBox("Mesh Export")
         mesh_layout = QtWidgets.QVBoxLayout(self.mesh_group)
         self.mesh_cb = QtWidgets.QCheckBox("Export mesh (FBX)")
-        self.mesh_cb.setChecked(False)
+        self.mesh_cb.setChecked(not (self._project_dir / SP_EXPORT_FILENAME).exists())
         mesh_layout.addWidget(self.mesh_cb)
         mesh_form = QtWidgets.QFormLayout()
         self.mesh_combo = QtWidgets.QComboBox()
@@ -1981,7 +3301,7 @@ class ExportDialog(QtWidgets.QDialog):
         self.mesh_options_widget = QtWidgets.QWidget()
         self.mesh_options_widget.setLayout(mesh_form)
         mesh_layout.addWidget(self.mesh_options_widget)
-        layout.addWidget(self.mesh_group)
+        content_layout.addWidget(self.mesh_group)
 
         self.texture_group = QtWidgets.QGroupBox("Texture Export")
         texture_layout = QtWidgets.QVBoxLayout(self.texture_group)
@@ -1994,6 +3314,12 @@ class ExportDialog(QtWidgets.QDialog):
 
         self.texture_sets_group = QtWidgets.QGroupBox("Texture Sets")
         texset_layout = QtWidgets.QVBoxLayout(self.texture_sets_group)
+        texset_layout.setContentsMargins(8, 6, 8, 6)
+        texset_layout.setSpacing(4)
+        self.texture_sets_group.setSizePolicy(
+            QtWidgets.QSizePolicy.Preferred,
+            QtWidgets.QSizePolicy.Fixed,
+        )
         texset_toolbar = QtWidgets.QHBoxLayout()
         self.texset_status = QtWidgets.QLabel("Selected: 0/0")
         texset_toolbar.addWidget(self.texset_status)
@@ -2005,16 +3331,35 @@ class ExportDialog(QtWidgets.QDialog):
         texset_toolbar.addWidget(self.texset_none_btn)
         texset_toolbar.addWidget(self.texset_refresh_btn)
         texset_layout.addLayout(texset_toolbar)
-        self.texset_list = QtWidgets.QListWidget()
+        self.texset_list = _DragCheckListWidget()
+        self.texset_list.setObjectName("gob_texset_list")
         self.texset_list.setMinimumWidth(280)
-        self.texset_list.setMinimumHeight(260)
-        self.texset_list.setAlternatingRowColors(True)
+        self.texset_list.setMinimumHeight(120)
+        self.texset_list.setFixedHeight(120)
+        self.texset_list.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Fixed,
+        )
+        self.texset_list.setStyleSheet(
+            "#gob_texset_list::item:checked { background: transparent; }"
+            "#gob_texset_list::item:selected { background: rgba(255, 255, 255, 0.08); }"
+            "#gob_texset_list::item { color: palette(text); }"
+        )
+        self.texset_list.setAlternatingRowColors(False)
         self.texset_list.setUniformItemSizes(True)
+        self._texset_delegate = _NeutralCheckedItemDelegate(self.texset_list)
+        self.texset_list.setItemDelegate(self._texset_delegate)
         self.texset_list.itemChanged.connect(self._update_texture_set_count)
         texset_layout.addWidget(self.texset_list)
 
         self.map_group = QtWidgets.QGroupBox("List of Exports")
         maps_layout = QtWidgets.QVBoxLayout(self.map_group)
+        maps_layout.setContentsMargins(8, 6, 8, 6)
+        maps_layout.setSpacing(4)
+        self.map_group.setSizePolicy(
+            QtWidgets.QSizePolicy.Preferred,
+            QtWidgets.QSizePolicy.Fixed,
+        )
         map_toolbar = QtWidgets.QHBoxLayout()
         self.map_status = QtWidgets.QLabel("Selected: 0/0")
         map_toolbar.addWidget(self.map_status)
@@ -2026,24 +3371,39 @@ class ExportDialog(QtWidgets.QDialog):
         map_toolbar.addWidget(self.select_none_btn)
         map_toolbar.addWidget(self.refresh_maps_btn)
         maps_layout.addLayout(map_toolbar)
-        self.map_list = QtWidgets.QListWidget()
-        self.map_list.setMinimumHeight(260)
+        self.map_list = _DragCheckListWidget()
+        self.map_list.setObjectName("gob_map_list")
+        self.map_list.setMinimumHeight(160)
+        self.map_list.setFixedHeight(160)
+        self.map_list.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Fixed,
+        )
+        self.map_list.setStyleSheet(
+            "#gob_map_list::item:checked { background: transparent; }"
+            "#gob_map_list::item:selected { background: rgba(255, 255, 255, 0.08); }"
+            "#gob_map_list::item { color: palette(text); }"
+        )
         self.map_list.setAlternatingRowColors(False)
         self.map_list.setUniformItemSizes(True)
+        self._map_delegate = _NeutralCheckedItemDelegate(self.map_list)
+        self.map_list.setItemDelegate(self._map_delegate)
         self.map_list.itemChanged.connect(self._update_map_count)
         maps_layout.addWidget(self.map_list)
 
         left_panel = QtWidgets.QWidget()
         left_layout = QtWidgets.QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(2)
         left_layout.addWidget(self.texture_sets_group)
         left_layout.addWidget(self.map_group)
+        left_layout.addStretch(1)
 
         self.texture_params_group = QtWidgets.QGroupBox("General Export Parameters")
         params_form = QtWidgets.QFormLayout(self.texture_params_group)
         self.output_dir_edit = QtWidgets.QLineEdit()
         self.output_dir_edit.setReadOnly(True)
-        self.output_dir_edit.setText(str(get_project_dir() / "textures"))
+        self.output_dir_edit.setText(str(self._project_dir / "textures"))
         self.open_output_btn = QtWidgets.QPushButton("Open")
         output_row = QtWidgets.QHBoxLayout()
         output_row.addWidget(self.output_dir_edit)
@@ -2125,7 +3485,13 @@ class ExportDialog(QtWidgets.QDialog):
         self.texture_splitter.setStretchFactor(1, 2)
         self.texture_splitter.setSizes([380, 520])
 
-        layout.addWidget(self.texture_group)
+        content_layout.addWidget(self.texture_group)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
 
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
@@ -2150,6 +3516,7 @@ class ExportDialog(QtWidgets.QDialog):
         self.user_preset_combo.currentIndexChanged.connect(self._apply_user_preset_selection)
         self.update_check_btn.clicked.connect(lambda: start_update_check(show_no_update=True, force_prompt=True))
         self.update_download_btn.clicked.connect(self._open_update_download)
+        self.report_bug_btn.clicked.connect(self._open_bug_report)
         add_update_listener(self._refresh_update_status)
 
         self._populate_texture_sets()
@@ -2169,13 +3536,20 @@ class ExportDialog(QtWidgets.QDialog):
         self._on_mesh_toggle(self.mesh_cb.isChecked())
         self._loading = False
         self._refresh_update_status()
+        self._refresh_linked_blender_state()
+        self._apply_initial_size()
+        self._center_on_screen()
 
     def closeEvent(self, event):
         remove_update_listener(self._refresh_update_status)
         try:
             options = self.get_options()
             state = self._serialize_options(options)
-            save_persistent_state(last_settings=state, user_presets=self._user_presets)
+            save_persistent_state(
+                last_settings=state,
+                user_presets=self._user_presets,
+                project_dir=self._project_dir,
+            )
         except Exception:
             pass
         super().closeEvent(event)
@@ -2190,9 +3564,34 @@ class ExportDialog(QtWidgets.QDialog):
         else:
             self.update_download_btn.setToolTip("")
 
+    def _center_on_screen(self):
+        screen = self.screen()
+        if screen is None:
+            screen = QtGui.QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        rect = screen.availableGeometry()
+        frame = self.frameGeometry()
+        frame.moveCenter(rect.center())
+        self.move(frame.topLeft())
+
     def _open_update_download(self):
         if _last_update_info and _last_update_info.get("download_url"):
             QtGui.QDesktopServices.openUrl(QtCore.QUrl(_last_update_info["download_url"]))
+
+    def _open_bug_report(self):
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl(BUG_REPORT_URL))
+
+    def _apply_initial_size(self):
+        screen = self.screen() or QtGui.QGuiApplication.primaryScreen()
+        width = 900
+        height = 700
+        if screen:
+            rect = screen.availableGeometry()
+            width = min(width, int(rect.width() * 0.95))
+            height = min(height, int(rect.height() * 0.85))
+        self.setMinimumSize(860, 620)
+        self.resize(width, height)
 
     def _on_textures_toggle(self, enabled):
         active = enabled and self.preset_combo.count() > 0
@@ -2252,7 +3651,7 @@ class ExportDialog(QtWidgets.QDialog):
     def _populate_texture_sets(self):
         self.texset_list.blockSignals(True)
         self.texset_list.clear()
-        texsets = sp.textureset.all_texture_sets()
+        texsets = get_all_texture_sets()
         if not texsets:
             item = QtWidgets.QListWidgetItem("No texture sets found")
             item.setFlags(QtCore.Qt.NoItemFlags)
@@ -2264,9 +3663,10 @@ class ExportDialog(QtWidgets.QDialog):
         pending_set = {name.lower() for name in pending or []}
         use_pending = pending is not None
         for texset in texsets:
-            name = texset.name()
+            name = get_sp_name(texset)
             item = QtWidgets.QListWidgetItem(name)
             item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setForeground(self.texset_list.palette().color(QtGui.QPalette.Text))
             if use_pending:
                 item.setCheckState(
                     QtCore.Qt.Checked if name.lower() in pending_set else QtCore.Qt.Unchecked
@@ -2382,6 +3782,55 @@ class ExportDialog(QtWidgets.QDialog):
         ensure_dir(path)
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
 
+    def _refresh_linked_blender_state(self):
+        self._linked_blender_file = read_linked_blender_file(self._project_dir)
+        detected_path = self._linked_blender_file or ""
+        allow_temp_open = self.open_temp_blender_cb.isChecked()
+        if detected_path and is_temp_blender_file(detected_path):
+            self.detected_blender_label.setText(
+                "Linked Blender project is unsaved.\n"
+                f"Detected: {detected_path}"
+            )
+            self.detected_blender_label.setVisible(True)
+            exists = False
+            try:
+                exists = Path(detected_path).is_file()
+            except OSError:
+                exists = False
+            if allow_temp_open and exists:
+                self.open_blender_cb.setEnabled(True)
+                self.open_blender_cb.setToolTip(detected_path)
+            else:
+                self.open_blender_cb.setEnabled(False)
+                self.open_blender_cb.setChecked(False)
+                if allow_temp_open:
+                    self.open_blender_cb.setToolTip("Temp linked Blender project not found.")
+                else:
+                    self.open_blender_cb.setToolTip("Linked Blender project is unsaved.")
+            return
+        exists = False
+        if detected_path:
+            try:
+                exists = Path(detected_path).is_file()
+            except OSError:
+                exists = False
+        if detected_path and not exists:
+            self.detected_blender_label.setText(
+                "Linked Blender project not found.\n"
+                f"Detected: {detected_path}"
+            )
+        elif detected_path:
+            self.detected_blender_label.setText(f"Detected: {detected_path}")
+        else:
+            self.detected_blender_label.setText("No linked Blender project detected.")
+        self.detected_blender_label.setVisible(True)
+        self.open_blender_cb.setEnabled(bool(exists))
+        if not exists:
+            self.open_blender_cb.setChecked(False)
+            self.open_blender_cb.setToolTip("No linked Blender project found.")
+        else:
+            self.open_blender_cb.setToolTip(detected_path)
+
     def _select_preset_by_ref(self, preset_ref):
         if not preset_ref:
             return False
@@ -2414,6 +3863,10 @@ class ExportDialog(QtWidgets.QDialog):
             self.mesh_cb.setChecked(bool(state["export_mesh"]))
         if "export_textures" in state:
             self.textures_cb.setChecked(bool(state["export_textures"]))
+        if "open_temp_blender_project" in state:
+            self.open_temp_blender_cb.setChecked(bool(state["open_temp_blender_project"]))
+        if "open_blender_project" in state:
+            self.open_blender_cb.setChecked(bool(state["open_blender_project"]))
         mesh_key = state.get("mesh_option")
         if mesh_key:
             for i in range(self.mesh_combo.count()):
@@ -2464,6 +3917,7 @@ class ExportDialog(QtWidgets.QDialog):
                 self._pending_texture_sets = texture_sets
                 self._apply_pending_texture_sets()
         self._refresh_map_list()
+        self._refresh_linked_blender_state()
 
     def _serialize_options(self, options):
         preset = options.get("preset")
@@ -2475,7 +3929,7 @@ class ExportDialog(QtWidgets.QDialog):
         texture_sets = options.get("texture_sets", [])
         texture_sets_value = texture_sets
         try:
-            all_sets = [texset.name() for texset in sp.textureset.all_texture_sets()]
+            all_sets = [get_sp_name(texset) for texset in get_all_texture_sets()]
         except Exception:
             all_sets = None
         if all_sets:
@@ -2486,6 +3940,8 @@ class ExportDialog(QtWidgets.QDialog):
         return {
             "export_mesh": options.get("export_mesh", True),
             "export_textures": options.get("export_textures", True),
+            "open_blender_project": options.get("open_blender_project", False),
+            "open_temp_blender_project": options.get("open_temp_blender_project", False),
             "mesh_option": mesh_key,
             "preset": preset_ref,
             "output_maps": options.get("output_maps", []),
@@ -2607,6 +4063,8 @@ class ExportDialog(QtWidgets.QDialog):
             "export_settings": dict(DEFAULT_EXPORT_SETTINGS),
             "texture_sets": None,
             "texture_splitter_sizes": self.texture_splitter.sizes(),
+            "open_blender_project": False,
+            "open_temp_blender_project": False,
         }
 
     def _find_default_export_preset(self):
@@ -2658,6 +4116,8 @@ class ExportDialog(QtWidgets.QDialog):
         return {
             "export_mesh": self.mesh_cb.isChecked(),
             "export_textures": self.textures_cb.isChecked(),
+            "open_blender_project": self.open_blender_cb.isChecked(),
+            "open_temp_blender_project": self.open_temp_blender_cb.isChecked(),
             "mesh_option": self.mesh_combo.currentData(),
             "preset": preset,
             "output_maps": output_maps,
@@ -2667,7 +4127,11 @@ class ExportDialog(QtWidgets.QDialog):
 
     def persist_last_settings(self, options):
         state = self._serialize_options(options)
-        save_persistent_state(last_settings=state, user_presets=self._user_presets)
+        save_persistent_state(
+            last_settings=state,
+            user_presets=self._user_presets,
+            project_dir=self._project_dir,
+        )
 
 
 class QuickPanel(QtWidgets.QWidget):
@@ -2750,18 +4214,66 @@ def manifest_timestamp(manifest, manifest_path):
 def manifest_targets_current_project(manifest, manifest_path):
     if not sp.project.is_open():
         return True
+    sp_project_file = get_sp_project_file_path_or_temp()
+    manifest_sp_file = manifest.get("sp_project_file") or manifest.get("sp_project_path")
+    if sp_project_file and manifest_sp_file:
+        if paths_match(sp_project_file, manifest_sp_file):
+            return True
     try:
         current_dir = get_project_dir()
     except Exception:
         current_dir = None
-    manifest_dir = Path(manifest_path).parent if manifest_path else None
-    if current_dir and manifest_dir and current_dir == manifest_dir:
-        return True
+    manifest_dir = project_dir_from_manifest_path(manifest_path)
+    if current_dir and manifest_dir:
+        return current_dir == manifest_dir
     current_name = get_project_name()
     manifest_name = sanitize_name(str(manifest.get("project") or ""))
     if current_name and manifest_name:
         return current_name.lower() == manifest_name.lower()
     return False
+
+
+def parse_force_new_token(argv=None):
+    args = argv if argv is not None else sys.argv
+    for arg in args:
+        if not isinstance(arg, str):
+            continue
+        for prefix in FORCE_NEW_TOKEN_ARG_PREFIXES:
+            if arg.startswith(prefix):
+                token = arg.split("=", 1)[-1].strip()
+                if token:
+                    return token
+    return ""
+
+
+def load_force_new_token():
+    token = os.environ.get(FORCE_NEW_TOKEN_ENV)
+    if token:
+        return token.strip()
+    return parse_force_new_token()
+
+
+def manifest_force_new_token(manifest):
+    if not isinstance(manifest, dict):
+        return ""
+    token = manifest.get("force_new_token")
+    return str(token).strip() if token else ""
+
+
+def force_new_token_matches(manifest):
+    token = manifest_force_new_token(manifest)
+    if not token:
+        return False
+    return bool(_force_new_token and token == _force_new_token)
+
+
+def should_accept_force_new_manifest(manifest):
+    token = manifest_force_new_token(manifest)
+    if token:
+        if _force_new_token and token == _force_new_token:
+            return True
+        return not sp.project.is_open()
+    return not sp.project.is_open()
 
 
 def import_from_blender(manifest_path=None, clear_auto_import=False):
@@ -2773,12 +4285,24 @@ def import_from_blender(manifest_path=None, clear_auto_import=False):
         manifest_path = Path(manifest_path)
         if manifest_path.exists():
             manifest = read_manifest(manifest_path)
-            project_dir = manifest_path.parent
+            project_dir = project_dir_from_manifest_path(manifest_path)
     else:
-        project_dir = get_project_dir()
-        manifest_path = project_dir / MANIFEST_FILENAME
-        if manifest_path.exists():
-            manifest = read_manifest(manifest_path)
+        sp_project_file = get_sp_project_file_path_or_temp() if sp.project.is_open() else ""
+        if sp_project_file:
+            candidate = find_manifest_for_sp_project(
+                bridge_roots,
+                sp_project_file,
+                source="blender",
+            )
+            if candidate:
+                manifest_path = candidate
+                manifest = read_manifest(manifest_path)
+                project_dir = project_dir_from_manifest_path(manifest_path)
+        if not manifest:
+            project_dir = get_project_dir()
+            manifest_path = find_project_manifest_path(project_dir)
+            if manifest_path and manifest_path.exists():
+                manifest = read_manifest(manifest_path)
         if not manifest or manifest.get("source") != "blender":
             latest = find_latest_manifest(bridge_roots, source="blender")
             if not latest:
@@ -2786,25 +4310,58 @@ def import_from_blender(manifest_path=None, clear_auto_import=False):
                 return
             manifest_path = latest
             manifest = read_manifest(manifest_path)
-            project_dir = manifest_path.parent
+            project_dir = project_dir_from_manifest_path(manifest_path)
     if not manifest:
         show_message("GoB Bridge", "Failed to read Blender export manifest.", QtWidgets.QMessageBox.Warning)
         return
+    linked_blender_file = str(manifest.get("blender_file") or "")
+    project_name = sanitize_name(str(manifest.get("project") or ""))
 
     mesh_path = manifest.get("mesh_fbx")
     high_path = manifest.get("high_mesh_fbx")
+    high_exported = manifest.get("high_mesh_exported")
+    had_high_path = bool(high_path)
+    if high_path:
+        high_path = Path(high_path)
+        if not high_path.is_absolute() and project_dir:
+            high_path = project_dir / high_path
+        high_path = str(high_path)
+    if high_path and not Path(high_path).is_file():
+        fallback = project_dir / BLENDER_HIGH_FILENAME if project_dir else None
+        if fallback and fallback.exists():
+            high_path = str(fallback)
+        else:
+            alt = find_mesh_in_roots(bridge_roots, project_name, BLENDER_HIGH_FILENAME)
+            if alt:
+                high_path = alt
+            else:
+                high_path = None
+                if had_high_path:
+                    clear_high_poly_when_ready()
+    if not high_path and high_exported is False:
+        clear_high_poly_when_ready()
     force_new_project = bool(manifest.get("force_new_project"))
-    if not mesh_path:
-        fallback = project_dir / BLENDER_EXPORT_FILENAME
-        mesh_path = str(fallback) if fallback.exists() else None
+    if mesh_path:
+        mesh_path = Path(mesh_path)
+        if not mesh_path.is_absolute() and project_dir:
+            mesh_path = project_dir / mesh_path
+        mesh_path = str(mesh_path)
+    if not mesh_path or not Path(mesh_path).is_file():
+        fallback = project_dir / BLENDER_EXPORT_FILENAME if project_dir else None
+        if fallback and fallback.exists():
+            mesh_path = str(fallback)
+        else:
+            alt = find_mesh_in_roots(bridge_roots, project_name, BLENDER_EXPORT_FILENAME)
+            if alt:
+                mesh_path = alt
     if not mesh_path or not Path(mesh_path).is_file():
         show_message("GoB Bridge", "Blender FBX file not found.", QtWidgets.QMessageBox.Warning)
         return
 
     if sp.project.is_open() and not force_new_project:
-        if clear_auto_import and not manifest_targets_current_project(manifest, manifest_path):
+        if not manifest_targets_current_project(manifest, manifest_path):
             if clear_auto_import:
-                clear_auto_import_flag(manifest_path, manifest)
+                return
             show_message(
                 "GoB Bridge",
                 "Blender export targets a different project. Close the current project and import again.",
@@ -2813,26 +4370,67 @@ def import_from_blender(manifest_path=None, clear_auto_import=False):
             return
         if not sp.project.is_in_edition_state():
             return
-        settings = sp.project.MeshReloadingSettings(
-            import_cameras=False,
-            preserve_strokes=True,
-        )
+        def make_reload_settings(preserve):
+            try:
+                return sp.project.MeshReloadingSettings(
+                    import_cameras=False,
+                    preserve_strokes=preserve,
+                )
+            except Exception:
+                return None
 
-        def _on_reload(status):
+        settings = make_reload_settings(True)
+        fallback_settings = make_reload_settings(False)
+        attempted_fallback = False
+
+        def _finish_reload(success):
             global _auto_import_in_progress
             _auto_import_in_progress = False
-            if status == sp.project.ReloadMeshStatus.SUCCESS:
+            if success:
                 if high_path:
                     apply_high_poly_when_ready(high_path)
                 if clear_auto_import:
                     clear_auto_import_flag(manifest_path, manifest)
+                sp_project_file = (
+                    get_sp_project_file_path_or_temp()
+                    or str(manifest.get("sp_project_file") or "")
+                    or str(manifest.get("sp_project_path") or "")
+                )
+                if linked_blender_file:
+                    update_project_settings(
+                        {"linked_blender_file": linked_blender_file},
+                        project_dir=get_project_dir(),
+                    )
+                    if sp_project_file:
+                        update_link_registry(
+                            sp_project_file=sp_project_file,
+                            blender_file=linked_blender_file,
+                            update_blender_link=not force_new_project,
+                        )
+                if sp_project_file:
+                    write_manifest_sp_project_file(manifest, project_dir, sp_project_file)
+                write_active_sp_info()
                 show_message("GoB Bridge", "Mesh reloaded from Blender.")
             else:
                 show_message("GoB Bridge", "Mesh reload failed.", QtWidgets.QMessageBox.Warning)
 
+        def _on_reload(status):
+            if status == sp.project.ReloadMeshStatus.SUCCESS:
+                _finish_reload(True)
+                return
+            nonlocal attempted_fallback
+            if not attempted_fallback and fallback_settings:
+                attempted_fallback = True
+                try:
+                    sp.project.reload_mesh(mesh_path, fallback_settings, _on_reload)
+                    return
+                except Exception:
+                    pass
+            _finish_reload(False)
+
         _auto_import_in_progress = True
         try:
-            sp.project.reload_mesh(mesh_path, settings, _on_reload)
+            sp.project.reload_mesh(mesh_path, settings or fallback_settings, _on_reload)
         except Exception as exc:
             _auto_import_in_progress = False
             message = str(exc).lower()
@@ -2840,15 +4438,32 @@ def import_from_blender(manifest_path=None, clear_auto_import=False):
                 global _auto_import_busy_until
                 _auto_import_busy_until = time.time() + 2.0
                 return
+            if (fallback_settings and settings and not attempted_fallback and
+                    any(key in message for key in ("stroke", "preserv", "scale", "unit"))):
+                attempted_fallback = True
+                try:
+                    _auto_import_in_progress = True
+                    sp.project.reload_mesh(mesh_path, fallback_settings, _on_reload)
+                    return
+                except Exception:
+                    _auto_import_in_progress = False
             show_message("GoB Bridge", f"Mesh reload failed: {exc}", QtWidgets.QMessageBox.Warning)
         return
-        return
 
-    if sp.project.is_open() and force_new_project:
-        try:
-            sp.project.close()
-        except Exception:
-            pass
+    if force_new_project:
+        if not should_accept_force_new_manifest(manifest):
+            if not clear_auto_import:
+                show_message(
+                    "GoB Bridge",
+                    "New instance project detected for a different Painter instance.",
+                    QtWidgets.QMessageBox.Warning,
+                )
+            return
+        if sp.project.is_open():
+            try:
+                sp.project.close()
+            except Exception:
+                pass
     project_settings = build_project_settings(manifest.get("sp_project_settings"))
     try:
         _auto_import_in_progress = True
@@ -2863,10 +4478,37 @@ def import_from_blender(manifest_path=None, clear_auto_import=False):
                 sp.project.create(**create_kwargs)
             else:
                 raise
+        if force_new_project and force_new_token_matches(manifest):
+            global _force_new_token
+            _force_new_token = ""
         if high_path:
             apply_high_poly_when_ready(high_path)
         if clear_auto_import:
             clear_auto_import_flag(manifest_path, manifest)
+        sp_project_file = (
+            get_sp_project_file_path_or_temp()
+            or str(manifest.get("sp_project_file") or "")
+            or str(manifest.get("sp_project_path") or "")
+        )
+        if linked_blender_file:
+            update_project_settings(
+                {"linked_blender_file": linked_blender_file},
+                project_dir=get_project_dir(),
+            )
+            if sp_project_file:
+                update_link_registry(
+                    sp_project_file=sp_project_file,
+                    blender_file=linked_blender_file,
+                    update_blender_link=not force_new_project,
+                )
+        if force_new_project:
+            update_project_settings(
+                {"force_new_project": True},
+                project_dir=project_dir,
+            )
+        if sp_project_file:
+            write_manifest_sp_project_file(manifest, project_dir, sp_project_file)
+        write_active_sp_info()
         _auto_import_in_progress = False
     except Exception:
         _auto_import_in_progress = False
@@ -2888,9 +4530,38 @@ def send_to_blender():
         return
     dialog.persist_last_settings(options)
 
-    project_dir = get_project_dir()
+    allow_temp_open = bool(options.get("open_temp_blender_project"))
+    sp_project_file = get_sp_project_file_path_or_temp()
+    project_dir = project_dir_for_send(sp_project_file)
     write_bridge_root_hint(project_dir.parent)
     ensure_dir(project_dir)
+
+    existing_manifest = read_manifest(find_project_manifest_path(project_dir))
+    existing_sp_project_file = ""
+    if isinstance(existing_manifest, dict):
+        existing_sp_project_file = str(existing_manifest.get("sp_project_file") or "")
+    linked_blender_file = read_linked_blender_file(project_dir)
+    linked_blender_exists = ""
+    if linked_blender_file:
+        try:
+            if Path(linked_blender_file).is_file():
+                if (not is_temp_blender_file(linked_blender_file)) or allow_temp_open:
+                    linked_blender_exists = linked_blender_file
+                else:
+                    linked_blender_exists = ""
+        except OSError:
+            linked_blender_exists = ""
+    force_new_project = bool(existing_manifest and existing_manifest.get("force_new_project"))
+    if not force_new_project:
+        project_settings = load_project_settings(project_dir)
+        if isinstance(project_settings, dict):
+            force_new_project = bool(project_settings.get("force_new_project"))
+    primary_sp_project_file = ""
+    if force_new_project and linked_blender_file:
+        primary_sp_project_file = resolve_primary_sp_project_for_blender(
+            linked_blender_file,
+            sp_project_file,
+        )
 
     manifest = {
         "version": 1,
@@ -2898,7 +4569,29 @@ def send_to_blender():
         "project": get_project_name(),
         "timestamp": time.time(),
     }
+    if linked_blender_file:
+        manifest["blender_file"] = linked_blender_file
+    if sp_project_file:
+        manifest["sp_project_file"] = sp_project_file
+    elif existing_sp_project_file:
+        manifest["sp_project_file"] = existing_sp_project_file
+    if primary_sp_project_file:
+        manifest["link_sp_project_file"] = primary_sp_project_file
+    if force_new_project:
+        manifest["force_new_project"] = True
+    if sp_project_file and linked_blender_file:
+        update_link_registry(
+            sp_project_file=sp_project_file,
+            blender_file=linked_blender_file,
+            update_blender_link=not primary_sp_project_file,
+        )
+        if primary_sp_project_file:
+            update_link_registry(
+                sp_project_file=primary_sp_project_file,
+                blender_file=linked_blender_file,
+            )
     exported_any = False
+    mesh_exported = False
     texture_errors = []
     texture_warnings = []
 
@@ -2909,6 +4602,7 @@ def send_to_blender():
             show_message("GoB Bridge", result.message, QtWidgets.QMessageBox.Warning)
         else:
             manifest["mesh_fbx"] = str(mesh_path)
+            mesh_exported = True
             exported_any = True
 
     if options["export_textures"]:
@@ -2917,6 +4611,8 @@ def send_to_blender():
             texture_errors.append("No export preset found.")
         else:
             normal_format = infer_normal_map_format_from_preset(preset)
+            if not normal_format:
+                normal_format = get_sp_normal_map_format()
             if normal_format:
                 manifest["normal_map_format"] = normal_format
             textures_dir = project_dir / "textures"
@@ -2934,7 +4630,7 @@ def send_to_blender():
                 texture_errors.append("No texture sets selected.")
             else:
                 stack_roots = collect_stack_roots(texture_sets)
-                stacks = [stack for _root, stack in stack_roots]
+                stacks = [stack for _, stack in stack_roots]
                 missing_before = collect_missing_map_channels(
                     preset,
                     output_maps,
@@ -2963,6 +4659,11 @@ def send_to_blender():
                             "maps": sanitized_maps,
                         },
                     }
+                basecolor_has_opacity = preset_basecolor_has_opacity(
+                    preset_for_export,
+                    stacks=stacks,
+                )
+                manifest["basecolor_has_opacity"] = basecolor_has_opacity
                 export_settings = options.get("export_settings") or DEFAULT_EXPORT_SETTINGS
                 export_params = build_export_parameters(export_settings)
                 export_list = build_export_list_for_preset(
@@ -2980,7 +4681,7 @@ def send_to_blender():
                         texture_sets,
                         stack_roots=stack_roots,
                     )
-                    selected_roots = [root for root, _stack in stack_roots]
+                    selected_roots = [root for root, _ in stack_roots]
                     selected_map_names = [name for name in output_maps if name]
                     exported_by_root = {}
                     for entry in export_list:
@@ -3031,7 +4732,7 @@ def send_to_blender():
                                 )
                             if removed_lines:
                                 warning_lines.append(
-                                    "Channels removed from the template (missing on all selected texture sets):\n"
+                                    "Channels removed from the template (missing on some selected texture sets):\n"
                                     + "\n".join(removed_lines)
                                 )
                         if roots_without_exports:
@@ -3118,7 +4819,7 @@ def send_to_blender():
                             append_log(project_dir, f"Export failed ({label}): {export_result.message}")
                             continue
                         textures = []
-                        for _key, files in export_result.textures.items():
+                        for files in export_result.textures.values():
                             for file in files:
                                 if not file:
                                     continue
@@ -3134,17 +4835,35 @@ def send_to_blender():
                     if not tried and not texture_errors:
                         texture_errors.append("No export preset available.")
 
+    manifest["mesh_exported"] = mesh_exported
     if not exported_any:
+        if options.get("open_blender_project") and linked_blender_exists:
+            open_linked_blender_file(linked_blender_exists, project_dir=project_dir)
         show_message("GoB Bridge", "Nothing was exported.", QtWidgets.QMessageBox.Warning)
         return
 
-    write_manifest(project_dir / MANIFEST_FILENAME, manifest)
+    manifest_path = project_manifest_path(project_dir)
+    ensure_dir(manifest_path.parent)
+    write_manifest(manifest_path, manifest)
+    if options.get("open_blender_project"):
+        if linked_blender_exists:
+            if not open_linked_blender_file(linked_blender_exists, project_dir=project_dir):
+                show_message(
+                    "GoB Bridge",
+                    "Failed to open the linked Blender project.",
+                    QtWidgets.QMessageBox.Warning,
+                )
+        else:
+            show_message(
+                "GoB Bridge",
+                "Linked Blender project not found.",
+                QtWidgets.QMessageBox.Warning,
+            )
     if texture_errors:
         details = "\n".join(texture_errors)
         show_message("GoB Bridge", f"Texture export failed:\n{details}", QtWidgets.QMessageBox.Warning)
     elif texture_warnings:
-        details = "\n\n".join(texture_warnings)
-        show_warning_dialog("GoB Bridge", "Export complete (optional maps missing).", details)
+        show_message("GoB Bridge", "Export complete.", QtWidgets.QMessageBox.Information)
     else:
         show_message("GoB Bridge", "Export complete. Use Blender to import.")
 
@@ -3156,9 +4875,16 @@ _auto_import_last_time = 0.0
 _auto_import_last_path = None
 _auto_import_in_progress = False
 _auto_import_busy_until = 0.0
+_auto_import_last_scan = 0.0
+_auto_import_last_active_write = 0.0
+AUTO_IMPORT_POLL_INTERVAL_MS = 3000
+AUTO_IMPORT_SCAN_COOLDOWN = 5.0
+AUTO_IMPORT_ACTIVE_WRITE_INTERVAL = 5.0
 
 
 def start_plugin():
+    global _force_new_token
+    _force_new_token = load_force_new_token()
     action_import = QtGui.QAction("GoB Bridge: Import from Blender")
     action_import.triggered.connect(import_from_blender)
     sp.ui.add_action(sp.ui.ApplicationMenu.File, action_import)
@@ -3185,18 +4911,47 @@ def start_plugin():
         global _auto_import_last_path
         global _auto_import_in_progress
         global _auto_import_busy_until
-        write_active_sp_info()
+        global _auto_import_last_scan
+        global _auto_import_last_active_write
+        now = time.time()
+        if now - _auto_import_last_active_write >= AUTO_IMPORT_ACTIVE_WRITE_INTERVAL:
+            write_active_sp_info()
+            _auto_import_last_active_write = now
         if _auto_import_in_progress:
             return
-        if _auto_import_busy_until and time.time() < _auto_import_busy_until:
+        if _auto_import_busy_until and now < _auto_import_busy_until:
             return
-        manifest_path = find_latest_manifest(get_candidate_bridge_roots(), source="blender")
+        manifest_path = None
+        manifest = None
+        active_blender = find_active_blender_info()
+        if active_blender:
+            project_dir = active_blender.get("project_dir")
+            if project_dir:
+                candidate_path = find_project_manifest_path(project_dir)
+                if candidate_path and candidate_path.exists():
+                    manifest = read_manifest(candidate_path)
+                    if manifest and manifest.get("source") == "blender" and manifest.get("auto_import"):
+                        manifest_path = candidate_path
+                    else:
+                        manifest = None
         if not manifest_path:
-            return
-        manifest = read_manifest(manifest_path)
+            if now - _auto_import_last_scan < AUTO_IMPORT_SCAN_COOLDOWN:
+                return
+            _auto_import_last_scan = now
+            manifest_path = find_latest_manifest(get_candidate_bridge_roots(), source="blender")
+            if not manifest_path:
+                return
+        if manifest is None:
+            manifest = read_manifest(manifest_path)
         if not manifest or not manifest.get("auto_import"):
             return
         ts = manifest_timestamp(manifest, manifest_path)
+        if manifest.get("force_new_project"):
+            if not should_accept_force_new_manifest(manifest):
+                return
+        elif sp.project.is_open():
+            if not manifest_targets_current_project(manifest, manifest_path):
+                return
         if (str(manifest_path) == _auto_import_last_path and ts <= _auto_import_last_time):
             return
         import_from_blender(manifest_path=manifest_path, clear_auto_import=True)
@@ -3207,7 +4962,7 @@ def start_plugin():
     global _auto_import_timer
     try:
         _auto_import_timer = QtCore.QTimer()
-        _auto_import_timer.setInterval(1500)
+        _auto_import_timer.setInterval(AUTO_IMPORT_POLL_INTERVAL_MS)
         _auto_import_timer.timeout.connect(_auto_import_poll)
         _auto_import_timer.start()
     except Exception:
@@ -3235,6 +4990,8 @@ def close_plugin():
     global _auto_import_busy_until
     _auto_import_in_progress = False
     _auto_import_busy_until = 0.0
+    global _force_new_token
+    _force_new_token = ""
     write_active_sp_info()
 
 
