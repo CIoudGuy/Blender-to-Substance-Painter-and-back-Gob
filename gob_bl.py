@@ -1,7 +1,7 @@
 bl_info = {
     "name": "GoB SP Bridge",
     "author": "Cloud Guy | cloud_was_taken on Discord",
-    "version": (0, 2, 0),
+    "version": (0, 2, 1),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > GoB SP",
     "description": "Send FBX to Substance 3D Painter and import meshes/textures back",
@@ -2539,17 +2539,59 @@ def open_path_in_file_manager(path):
 
 
 def is_sp_running():
-    try:
-        output = subprocess.check_output(
-            ["tasklist", "/FO", "CSV"],
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
+    name_tokens = ("adobe substance 3d painter", "substance 3d painter")
+
+    def _contains_sp_name(text):
+        haystack = (text or "").lower()
+        return any(token in haystack for token in name_tokens)
+
+    def _run_capture(cmd, timeout=2.0):
+        kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "ignore",
+            "timeout": timeout,
+            "check": False,
+        }
+        if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        try:
+            result = subprocess.run(cmd, **kwargs)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return ""
+        return (result.stdout or "") + "\n" + (result.stderr or "")
+
+    if os.name == "nt":
+        for cmd in (["tasklist", "/FO", "CSV", "/NH"], ["tasklist", "/FO", "CSV"]):
+            if _contains_sp_name(_run_capture(cmd)):
+                return True
+        ps_cmd = (
+            "$ErrorActionPreference='SilentlyContinue'; "
+            "Get-Process | Where-Object { "
+            "$_.ProcessName -like '*Substance*Painter*' -or "
+            "$_.ProcessName -like '*Adobe*Substance*Painter*' "
+            "} | Select-Object -ExpandProperty ProcessName"
         )
-    except OSError:
-        return False
-    return ("Adobe Substance 3D Painter.exe" in output or
-            "Substance 3D Painter.exe" in output)
+        return _contains_sp_name(
+            _run_capture(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    ps_cmd,
+                ]
+            )
+        )
+
+    # macOS/Linux fallback when Windows process tools are unavailable.
+    if _contains_sp_name(_run_capture(["pgrep", "-fl", "Substance 3D Painter"])):
+        return True
+    return _contains_sp_name(_run_capture(["ps", "-A", "-o", "comm="]))
 
 
 _update_check_in_progress = False
@@ -3102,7 +3144,10 @@ class GOB_OT_SendToSP(Operator):
         manifest_path = project_manifest_path(project_dir)
         if manifest_path:
             ensure_dir(manifest_path.parent)
-        sp_running = is_sp_running()
+        try:
+            sp_running = is_sp_running()
+        except Exception:
+            sp_running = False
         manifest = {
             "version": 1,
             "source": "blender",
@@ -3162,8 +3207,7 @@ class GOB_OT_SendToSP(Operator):
             else:
                 self.report({"WARNING"}, "Substance Painter executable not found")
         else:
-            if (linked_sp_project and not already_open and
-                    (should_force_open or (prefs and prefs.open_linked_sp_project))):
+            if linked_sp_project and not already_open and should_force_open:
                 if is_temp_sp_project_file(linked_sp_project, prefs):
                     if not sp_running and sp_exe:
                         try:
@@ -3435,64 +3479,6 @@ class GOB_PT_Panel(Panel):
         layout = self.layout
         prefs = get_prefs(context)
         scene = context.scene
-        active_info = None
-        project_dir = ""
-        blender_file = ""
-        auto_sp_project = ""
-        linked_sp_project = ""
-        auto_exists = False
-        auto_is_temp = False
-        if prefs:
-            global _ui_link_cache
-            now = time.time()
-            blender_file = get_blender_file_path_or_temp(prefs)
-            project_dir = get_project_dir_fast(context, prefs)
-            cache_ok = (
-                now - _ui_link_cache.get("timestamp", 0.0) < UI_LINK_CACHE_TTL
-                and _ui_link_cache.get("blender_file") == blender_file
-                and _ui_link_cache.get("project_dir") == str(project_dir)
-            )
-            if cache_ok:
-                active_info = _ui_link_cache.get("active_info")
-                auto_sp_project = _ui_link_cache.get("auto_sp_project", "")
-                linked_sp_project = _ui_link_cache.get("linked_sp_project", "")
-                auto_exists = bool(_ui_link_cache.get("auto_exists"))
-                auto_is_temp = bool(_ui_link_cache.get("auto_is_temp"))
-            else:
-                active_info = read_active_sp_info(
-                    project_meta_dir(project_dir) / ACTIVE_SP_INFO_FILENAME
-                )
-                if not active_info:
-                    active_info = find_active_sp_project_info(prefs)
-                auto_sp_project = get_linked_sp_project_path_fast(
-                    project_dir,
-                    active_info=active_info,
-                    blender_file=blender_file,
-                    prefs=prefs,
-                )
-                linked_sp_project = resolve_linked_sp_project_file_fast(
-                    project_dir,
-                    active_info=active_info,
-                    blender_file=blender_file,
-                    prefs=prefs,
-                )
-                if auto_sp_project:
-                    auto_is_temp = is_temp_sp_project_file(auto_sp_project, prefs)
-                    if not auto_is_temp:
-                        try:
-                            auto_exists = Path(auto_sp_project).is_file()
-                        except OSError:
-                            auto_exists = False
-                _ui_link_cache = {
-                    "timestamp": now,
-                    "blender_file": blender_file,
-                    "project_dir": str(project_dir),
-                    "active_info": active_info,
-                    "auto_sp_project": auto_sp_project,
-                    "linked_sp_project": linked_sp_project,
-                    "auto_is_temp": auto_is_temp,
-                    "auto_exists": auto_exists,
-                }
         show_export = getattr(scene, "gob_sp_ui_show_export_settings", True)
         row = layout.row(align=True)
         row.operator(GOB_OT_SendToSP.bl_idname, icon="EXPORT")
@@ -3572,19 +3558,6 @@ class GOB_PT_Panel(Panel):
                 icon = "TRIA_DOWN" if prefs.ui_show_project_link else "TRIA_RIGHT"
                 row.prop(prefs, "ui_show_project_link", icon=icon, emboss=False, text="Project Link")
                 if prefs.ui_show_project_link:
-                    if auto_sp_project and auto_is_temp:
-                        link_box.label(text="Linked SP project is unsaved", icon="INFO")
-                        link_box.label(text=f"Detected: {auto_sp_project}", icon="INFO")
-                    elif auto_sp_project and not auto_exists:
-                        link_box.label(text="Linked SP project not found", icon="INFO")
-                        link_box.label(text=f"Detected: {auto_sp_project}", icon="INFO")
-                    elif auto_sp_project:
-                        link_box.label(text=f"Detected: {auto_sp_project}", icon="INFO")
-                    else:
-                        link_box.label(text="No linked SP project detected", icon="INFO")
-                    link_toggle = link_box.row()
-                    link_toggle.enabled = bool(linked_sp_project)
-                    link_toggle.prop(prefs, "open_linked_sp_project", text="Open linked project on send")
                     link_force = link_box.row()
                     link_force.prop(
                         prefs,

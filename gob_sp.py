@@ -43,7 +43,7 @@ UPDATE_URL = (
 BUG_REPORT_URL = (
     "https://github.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/issues"
 )
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.2.1"
 
 EXPORT_FORMATS = [
     ("png", "PNG"),
@@ -86,12 +86,19 @@ SETTINGS_VERSION = 1
 PROJECT_SETTINGS_FILENAME = "gob_sp_project_settings.json"
 DEFAULT_USER_PRESET_NAME = "Default"
 UPDATE_IGNORE_VERSION_KEY = "update_ignore_version"
+SEND_TO_BLENDER_SHORTCUT_KEY = "send_to_blender_shortcut"
+SEND_TO_BLENDER_SHORTCUT_CANDIDATES = (
+    "Ctrl+Alt+Shift+B",
+    "Ctrl+Alt+Shift+G",
+    "Ctrl+Alt+Shift+S",
+)
 _temp_session_id = None
 _temp_sp_project_file = None
 _temp_blender_file = None
 _last_sp_project_file = None
 _project_dir_cache = {}
 _force_new_token = ""
+_send_to_blender_action = None
 
 
 def _rgb_channels(src_type, src_name):
@@ -309,6 +316,142 @@ def save_settings(data):
             json.dump(data, handle, indent=2, ensure_ascii=True)
     except OSError:
         return
+
+
+def normalize_shortcut_text(value):
+    if not value:
+        return ""
+    try:
+        seq = QtGui.QKeySequence(str(value))
+    except Exception:
+        return ""
+    return seq.toString(QtGui.QKeySequence.PortableText) or ""
+
+
+def action_shortcut_texts(action):
+    if action is None:
+        return []
+    sequences = []
+    try:
+        sequences = list(action.shortcuts())
+    except Exception:
+        sequences = []
+    if not sequences:
+        try:
+            seq = action.shortcut()
+            if seq:
+                sequences = [seq]
+        except Exception:
+            sequences = []
+    texts = []
+    for seq in sequences:
+        try:
+            text = seq.toString(QtGui.QKeySequence.PortableText)
+        except Exception:
+            text = ""
+        normalized = normalize_shortcut_text(text)
+        if normalized and normalized not in texts:
+            texts.append(normalized)
+    return texts
+
+
+def iter_application_actions():
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return []
+    actions = []
+    seen = set()
+    widgets = []
+    try:
+        widgets = list(app.topLevelWidgets())
+    except Exception:
+        widgets = []
+    for widget in widgets:
+        if widget is None:
+            continue
+        local_actions = []
+        try:
+            local_actions.extend(widget.actions())
+        except Exception:
+            pass
+        try:
+            local_actions.extend(widget.findChildren(QtGui.QAction))
+        except Exception:
+            pass
+        for action in local_actions:
+            if action is None:
+                continue
+            key = id(action)
+            if key in seen:
+                continue
+            seen.add(key)
+            actions.append(action)
+    return actions
+
+
+def find_shortcut_conflict(shortcut_text, ignore_action=None):
+    target = normalize_shortcut_text(shortcut_text)
+    if not target:
+        return ""
+    target_lc = target.lower()
+    for action in iter_application_actions():
+        if ignore_action is not None and action is ignore_action:
+            continue
+        for text in action_shortcut_texts(action):
+            if text.lower() != target_lc:
+                continue
+            try:
+                label = str(action.text() or "").strip()
+            except Exception:
+                label = ""
+            return label or "another command"
+    return ""
+
+
+def pick_default_send_to_blender_shortcut(ignore_action=None):
+    for candidate in SEND_TO_BLENDER_SHORTCUT_CANDIDATES:
+        normalized = normalize_shortcut_text(candidate)
+        if not normalized:
+            continue
+        if not find_shortcut_conflict(normalized, ignore_action=ignore_action):
+            return normalized
+    return normalize_shortcut_text(SEND_TO_BLENDER_SHORTCUT_CANDIDATES[0])
+
+
+def get_send_to_blender_shortcut(ignore_action=None):
+    data = load_settings()
+    configured = normalize_shortcut_text(data.get(SEND_TO_BLENDER_SHORTCUT_KEY))
+    if configured:
+        return configured
+    default_value = pick_default_send_to_blender_shortcut(ignore_action=ignore_action)
+    data[SEND_TO_BLENDER_SHORTCUT_KEY] = default_value
+    save_settings(data)
+    return default_value
+
+
+def apply_send_to_blender_shortcut(shortcut_text=None):
+    if _send_to_blender_action is None:
+        return ""
+    normalized = normalize_shortcut_text(shortcut_text)
+    if not normalized:
+        normalized = get_send_to_blender_shortcut(ignore_action=_send_to_blender_action)
+    try:
+        _send_to_blender_action.setShortcut(QtGui.QKeySequence(normalized))
+        _send_to_blender_action.setShortcutContext(QtCore.Qt.ShortcutContext.ApplicationShortcut)
+    except Exception:
+        return ""
+    return normalized
+
+
+def set_send_to_blender_shortcut(shortcut_text):
+    normalized = normalize_shortcut_text(shortcut_text)
+    if not normalized:
+        normalized = pick_default_send_to_blender_shortcut(ignore_action=_send_to_blender_action)
+    data = load_settings()
+    data[SEND_TO_BLENDER_SHORTCUT_KEY] = normalized
+    save_settings(data)
+    apply_send_to_blender_shortcut(normalized)
+    return normalized
 
 
 def project_manifest_path(project_dir):
@@ -3212,7 +3355,6 @@ class ExportDialog(QtWidgets.QDialog):
         self._loading = True
 
         self._project_dir = get_project_dir()
-        self._linked_blender_file = read_linked_blender_file(self._project_dir)
 
         state = load_persistent_state(self._project_dir)
         self._last_state = state.get("last_settings", {})
@@ -3266,23 +3408,19 @@ class ExportDialog(QtWidgets.QDialog):
         preset_widget.setLayout(preset_bar)
         content_layout.addWidget(preset_widget)
 
-        self.link_group = QtWidgets.QGroupBox("Linked Blender Project")
-        link_layout = QtWidgets.QVBoxLayout(self.link_group)
-        link_layout.setContentsMargins(8, 6, 8, 6)
-        link_layout.setSpacing(4)
-        self.detected_blender_label = QtWidgets.QLabel()
-        self.detected_blender_label.setWordWrap(True)
-        self.detected_blender_label.setStyleSheet("color: #666;")
-        link_layout.addWidget(self.detected_blender_label)
-        self.open_blender_cb = QtWidgets.QCheckBox("Open linked project on export")
-        link_layout.addWidget(self.open_blender_cb)
-        self.open_temp_blender_cb = QtWidgets.QCheckBox("Allow opening temp linked project")
-        self.open_temp_blender_cb.setToolTip(
-            "Enable opening a linked unsaved Blender file from the bridge temp folder."
+        hotkey_bar = QtWidgets.QHBoxLayout()
+        hotkey_bar.addWidget(QtWidgets.QLabel("Send hotkey"))
+        self.send_hotkey_edit = QtWidgets.QKeySequenceEdit()
+        self.send_hotkey_edit.setToolTip("Shortcut for GoB Bridge: Send to Blender")
+        self.send_hotkey_edit.setKeySequence(
+            QtGui.QKeySequence(get_send_to_blender_shortcut(ignore_action=_send_to_blender_action))
         )
-        link_layout.addWidget(self.open_temp_blender_cb)
-        self.open_temp_blender_cb.toggled.connect(self._refresh_linked_blender_state)
-        content_layout.addWidget(self.link_group)
+        self.send_hotkey_reset_btn = QtWidgets.QPushButton("Reset")
+        hotkey_bar.addWidget(self.send_hotkey_edit, 1)
+        hotkey_bar.addWidget(self.send_hotkey_reset_btn)
+        hotkey_widget = QtWidgets.QWidget()
+        hotkey_widget.setLayout(hotkey_bar)
+        content_layout.addWidget(hotkey_widget)
 
         self.mesh_group = QtWidgets.QGroupBox("Mesh Export")
         mesh_layout = QtWidgets.QVBoxLayout(self.mesh_group)
@@ -3514,6 +3652,8 @@ class ExportDialog(QtWidgets.QDialog):
         self.save_preset_btn.clicked.connect(self._save_user_preset)
         self.delete_preset_btn.clicked.connect(self._delete_user_preset)
         self.user_preset_combo.currentIndexChanged.connect(self._apply_user_preset_selection)
+        self.send_hotkey_edit.editingFinished.connect(self._on_send_hotkey_edited)
+        self.send_hotkey_reset_btn.clicked.connect(self._reset_send_hotkey)
         self.update_check_btn.clicked.connect(lambda: start_update_check(show_no_update=True, force_prompt=True))
         self.update_download_btn.clicked.connect(self._open_update_download)
         self.report_bug_btn.clicked.connect(self._open_bug_report)
@@ -3536,7 +3676,6 @@ class ExportDialog(QtWidgets.QDialog):
         self._on_mesh_toggle(self.mesh_cb.isChecked())
         self._loading = False
         self._refresh_update_status()
-        self._refresh_linked_blender_state()
         self._apply_initial_size()
         self._center_on_screen()
 
@@ -3782,54 +3921,36 @@ class ExportDialog(QtWidgets.QDialog):
         ensure_dir(path)
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
 
-    def _refresh_linked_blender_state(self):
-        self._linked_blender_file = read_linked_blender_file(self._project_dir)
-        detected_path = self._linked_blender_file or ""
-        allow_temp_open = self.open_temp_blender_cb.isChecked()
-        if detected_path and is_temp_blender_file(detected_path):
-            self.detected_blender_label.setText(
-                "Linked Blender project is unsaved.\n"
-                f"Detected: {detected_path}"
-            )
-            self.detected_blender_label.setVisible(True)
-            exists = False
-            try:
-                exists = Path(detected_path).is_file()
-            except OSError:
-                exists = False
-            if allow_temp_open and exists:
-                self.open_blender_cb.setEnabled(True)
-                self.open_blender_cb.setToolTip(detected_path)
-            else:
-                self.open_blender_cb.setEnabled(False)
-                self.open_blender_cb.setChecked(False)
-                if allow_temp_open:
-                    self.open_blender_cb.setToolTip("Temp linked Blender project not found.")
-                else:
-                    self.open_blender_cb.setToolTip("Linked Blender project is unsaved.")
+    def _set_send_hotkey_editor(self, shortcut_text):
+        self.send_hotkey_edit.blockSignals(True)
+        self.send_hotkey_edit.setKeySequence(QtGui.QKeySequence(shortcut_text))
+        self.send_hotkey_edit.blockSignals(False)
+
+    def _on_send_hotkey_edited(self):
+        shortcut_text = normalize_shortcut_text(
+            self.send_hotkey_edit.keySequence().toString(QtGui.QKeySequence.PortableText)
+        )
+        if not shortcut_text:
+            current = get_send_to_blender_shortcut(ignore_action=_send_to_blender_action)
+            self._set_send_hotkey_editor(current)
             return
-        exists = False
-        if detected_path:
-            try:
-                exists = Path(detected_path).is_file()
-            except OSError:
-                exists = False
-        if detected_path and not exists:
-            self.detected_blender_label.setText(
-                "Linked Blender project not found.\n"
-                f"Detected: {detected_path}"
+        conflict = find_shortcut_conflict(shortcut_text, ignore_action=_send_to_blender_action)
+        if conflict:
+            show_message(
+                "GoB Bridge",
+                f"Shortcut {shortcut_text} is already used by {conflict}. Choose another.",
+                QtWidgets.QMessageBox.Warning,
             )
-        elif detected_path:
-            self.detected_blender_label.setText(f"Detected: {detected_path}")
-        else:
-            self.detected_blender_label.setText("No linked Blender project detected.")
-        self.detected_blender_label.setVisible(True)
-        self.open_blender_cb.setEnabled(bool(exists))
-        if not exists:
-            self.open_blender_cb.setChecked(False)
-            self.open_blender_cb.setToolTip("No linked Blender project found.")
-        else:
-            self.open_blender_cb.setToolTip(detected_path)
+            current = get_send_to_blender_shortcut(ignore_action=_send_to_blender_action)
+            self._set_send_hotkey_editor(current)
+            return
+        applied = set_send_to_blender_shortcut(shortcut_text)
+        self._set_send_hotkey_editor(applied)
+
+    def _reset_send_hotkey(self):
+        default_shortcut = pick_default_send_to_blender_shortcut(ignore_action=_send_to_blender_action)
+        applied = set_send_to_blender_shortcut(default_shortcut)
+        self._set_send_hotkey_editor(applied)
 
     def _select_preset_by_ref(self, preset_ref):
         if not preset_ref:
@@ -3863,10 +3984,6 @@ class ExportDialog(QtWidgets.QDialog):
             self.mesh_cb.setChecked(bool(state["export_mesh"]))
         if "export_textures" in state:
             self.textures_cb.setChecked(bool(state["export_textures"]))
-        if "open_temp_blender_project" in state:
-            self.open_temp_blender_cb.setChecked(bool(state["open_temp_blender_project"]))
-        if "open_blender_project" in state:
-            self.open_blender_cb.setChecked(bool(state["open_blender_project"]))
         mesh_key = state.get("mesh_option")
         if mesh_key:
             for i in range(self.mesh_combo.count()):
@@ -3917,7 +4034,6 @@ class ExportDialog(QtWidgets.QDialog):
                 self._pending_texture_sets = texture_sets
                 self._apply_pending_texture_sets()
         self._refresh_map_list()
-        self._refresh_linked_blender_state()
 
     def _serialize_options(self, options):
         preset = options.get("preset")
@@ -3940,8 +4056,8 @@ class ExportDialog(QtWidgets.QDialog):
         return {
             "export_mesh": options.get("export_mesh", True),
             "export_textures": options.get("export_textures", True),
-            "open_blender_project": options.get("open_blender_project", False),
-            "open_temp_blender_project": options.get("open_temp_blender_project", False),
+            "open_blender_project": False,
+            "open_temp_blender_project": False,
             "mesh_option": mesh_key,
             "preset": preset_ref,
             "output_maps": options.get("output_maps", []),
@@ -4116,8 +4232,8 @@ class ExportDialog(QtWidgets.QDialog):
         return {
             "export_mesh": self.mesh_cb.isChecked(),
             "export_textures": self.textures_cb.isChecked(),
-            "open_blender_project": self.open_blender_cb.isChecked(),
-            "open_temp_blender_project": self.open_temp_blender_cb.isChecked(),
+            "open_blender_project": False,
+            "open_temp_blender_project": False,
             "mesh_option": self.mesh_combo.currentData(),
             "preset": preset,
             "output_maps": output_maps,
@@ -4530,7 +4646,6 @@ def send_to_blender():
         return
     dialog.persist_last_settings(options)
 
-    allow_temp_open = bool(options.get("open_temp_blender_project"))
     sp_project_file = get_sp_project_file_path_or_temp()
     project_dir = project_dir_for_send(sp_project_file)
     write_bridge_root_hint(project_dir.parent)
@@ -4541,16 +4656,6 @@ def send_to_blender():
     if isinstance(existing_manifest, dict):
         existing_sp_project_file = str(existing_manifest.get("sp_project_file") or "")
     linked_blender_file = read_linked_blender_file(project_dir)
-    linked_blender_exists = ""
-    if linked_blender_file:
-        try:
-            if Path(linked_blender_file).is_file():
-                if (not is_temp_blender_file(linked_blender_file)) or allow_temp_open:
-                    linked_blender_exists = linked_blender_file
-                else:
-                    linked_blender_exists = ""
-        except OSError:
-            linked_blender_exists = ""
     force_new_project = bool(existing_manifest and existing_manifest.get("force_new_project"))
     if not force_new_project:
         project_settings = load_project_settings(project_dir)
@@ -4837,28 +4942,12 @@ def send_to_blender():
 
     manifest["mesh_exported"] = mesh_exported
     if not exported_any:
-        if options.get("open_blender_project") and linked_blender_exists:
-            open_linked_blender_file(linked_blender_exists, project_dir=project_dir)
         show_message("GoB Bridge", "Nothing was exported.", QtWidgets.QMessageBox.Warning)
         return
 
     manifest_path = project_manifest_path(project_dir)
     ensure_dir(manifest_path.parent)
     write_manifest(manifest_path, manifest)
-    if options.get("open_blender_project"):
-        if linked_blender_exists:
-            if not open_linked_blender_file(linked_blender_exists, project_dir=project_dir):
-                show_message(
-                    "GoB Bridge",
-                    "Failed to open the linked Blender project.",
-                    QtWidgets.QMessageBox.Warning,
-                )
-        else:
-            show_message(
-                "GoB Bridge",
-                "Linked Blender project not found.",
-                QtWidgets.QMessageBox.Warning,
-            )
     if texture_errors:
         details = "\n".join(texture_errors)
         show_message("GoB Bridge", f"Texture export failed:\n{details}", QtWidgets.QMessageBox.Warning)
@@ -4884,6 +4973,7 @@ AUTO_IMPORT_ACTIVE_WRITE_INTERVAL = 5.0
 
 def start_plugin():
     global _force_new_token
+    global _send_to_blender_action
     _force_new_token = load_force_new_token()
     action_import = QtGui.QAction("GoB Bridge: Import from Blender")
     action_import.triggered.connect(import_from_blender)
@@ -4892,6 +4982,11 @@ def start_plugin():
 
     action_send = QtGui.QAction("GoB Bridge: Send to Blender")
     action_send.triggered.connect(send_to_blender)
+    _send_to_blender_action = action_send
+    configured_shortcut = get_send_to_blender_shortcut(ignore_action=action_send)
+    if find_shortcut_conflict(configured_shortcut, ignore_action=action_send):
+        configured_shortcut = pick_default_send_to_blender_shortcut(ignore_action=action_send)
+    set_send_to_blender_shortcut(configured_shortcut)
     sp.ui.add_action(sp.ui.ApplicationMenu.File, action_send)
     _ui_elements.append(action_send)
 
@@ -4970,9 +5065,11 @@ def start_plugin():
 
 
 def close_plugin():
+    global _send_to_blender_action
     for element in _ui_elements:
         sp.ui.delete_ui_element(element)
     _ui_elements.clear()
+    _send_to_blender_action = None
     global _quick_panel_widget
     _quick_panel_widget = None
     global _auto_import_timer
