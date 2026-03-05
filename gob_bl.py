@@ -1,7 +1,7 @@
 bl_info = {
     "name": "GoB SP Bridge",
     "author": "Cloud Guy | cloud_was_taken on Discord",
-    "version": (0, 2, 1),
+    "version": (0, 2, 2),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > GoB SP",
     "description": "Send FBX to Substance 3D Painter and import meshes/textures back",
@@ -53,6 +53,7 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".tga", ".exr"}
 CACHE_WARN_BYTES = 35 * 1024 ** 3
 DEFAULT_CACHE_LIMIT_GB = 35.0
 UI_LINK_CACHE_TTL = 0.75
+OBJECT_PROJECT_KEY_PROP = "gob_sp_project_key"
 _temp_session_id = None
 _temp_blender_file = None
 _last_blender_file = None
@@ -1134,6 +1135,82 @@ def get_manifest_blender_file(manifest):
     return str(value) if value else ""
 
 
+def manifest_project_keys(manifest, manifest_path=None):
+    if not isinstance(manifest, dict):
+        return []
+    values = [
+        get_manifest_sp_project_file(manifest),
+        get_manifest_link_sp_project_file(manifest),
+    ]
+    if manifest_path:
+        try:
+            project_dir = project_dir_from_manifest_path(manifest_path)
+        except Exception:
+            project_dir = None
+        if project_dir:
+            values.append(str(project_dir))
+    keys = []
+    seen = set()
+    for value in values:
+        if not value:
+            continue
+        key = normalize_path_key(value)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return keys
+
+
+def get_object_project_key(obj):
+    if not obj:
+        return ""
+    try:
+        value = obj.get(OBJECT_PROJECT_KEY_PROP)
+    except Exception:
+        return ""
+    if not value:
+        return ""
+    try:
+        return str(value)
+    except Exception:
+        return ""
+
+
+def tag_objects_with_project_key(context, objects, project_key, clear_existing=False):
+    if not context or not project_key:
+        return
+    mesh_objects = [obj for obj in objects if obj and obj.type == "MESH"]
+    keep_names = {obj.name for obj in mesh_objects}
+    if clear_existing:
+        for obj in context.scene.objects:
+            if obj.type != "MESH" or obj.name in keep_names:
+                continue
+            if get_object_project_key(obj) != project_key:
+                continue
+            try:
+                del obj[OBJECT_PROJECT_KEY_PROP]
+            except Exception:
+                continue
+    for obj in mesh_objects:
+        try:
+            obj[OBJECT_PROJECT_KEY_PROP] = project_key
+        except Exception:
+            continue
+
+
+def find_project_tag_targets(context, project_keys):
+    if not project_keys:
+        return []
+    key_set = {key for key in project_keys if key}
+    if not key_set:
+        return []
+    return [
+        obj for obj in context.scene.objects
+        if obj.type == "MESH" and get_object_project_key(obj) in key_set
+    ]
+
+
 def resolve_active_sp_project_info(context, prefs):
     project_dir = get_project_dir(context, prefs)
     if project_dir:
@@ -1941,9 +2018,13 @@ def find_signature_targets(context, manifest):
     ]
 
 
-def find_texture_targets(context, grouped):
+def find_texture_targets(context, grouped, project_keys=None):
     if not grouped:
         return []
+    if project_keys:
+        tagged = find_project_tag_targets(context, project_keys)
+        if tagged:
+            return tagged
     keys = {normalize_match_name(key) for key in grouped if key}
     matches = []
     for obj in context.scene.objects:
@@ -1965,7 +2046,6 @@ def find_texture_targets(context, grouped):
     if len(keys) == 1:
         if context.active_object and context.active_object.type == "MESH":
             return [context.active_object]
-        return [obj for obj in context.scene.objects if obj.type == "MESH"]
     return []
 
 
@@ -3294,6 +3374,8 @@ class GOB_OT_ImportFromSP(Operator):
             self.report({"ERROR"}, "Failed to read bridge manifest")
             return {"CANCELLED"}
         project_dir = project_dir_from_manifest_path(manifest_path)
+        project_keys = manifest_project_keys(manifest, manifest_path=manifest_path)
+        primary_project_key = project_keys[0] if project_keys else ""
         sp_project_file = get_manifest_sp_project_file(manifest)
         link_sp_project_file = get_manifest_link_sp_project_file(manifest)
         blender_file = get_manifest_blender_file(manifest) or current_blender_file
@@ -3324,9 +3406,23 @@ class GOB_OT_ImportFromSP(Operator):
         new_objects = []
         if mesh_path and Path(mesh_path).is_file():
             new_objects = import_fbx(mesh_path)
+            if primary_project_key and new_objects:
+                tag_objects_with_project_key(
+                    context,
+                    new_objects,
+                    primary_project_key,
+                    clear_existing=True,
+                )
 
         texture_paths = gather_texture_paths(manifest)
         targets = list(new_objects)
+        project_targets = find_project_tag_targets(context, project_keys)
+        if project_targets:
+            existing = {obj.name for obj in targets}
+            for obj in project_targets:
+                if obj.name not in existing:
+                    targets.append(obj)
+                    existing.add(obj.name)
         signature_targets = find_signature_targets(context, manifest)
         if signature_targets:
             existing = {obj.name for obj in targets}
@@ -3337,7 +3433,7 @@ class GOB_OT_ImportFromSP(Operator):
         grouped = group_textures(texture_paths) if texture_paths else {}
         strict = False
         if grouped:
-            matched_targets = find_texture_targets(context, grouped)
+            matched_targets = find_texture_targets(context, grouped, project_keys=project_keys)
             if matched_targets:
                 if targets:
                     existing = {obj.name for obj in targets}
@@ -3348,14 +3444,23 @@ class GOB_OT_ImportFromSP(Operator):
                 else:
                     targets = matched_targets
         if not targets and grouped:
-            targets = find_texture_targets(context, grouped)
+            targets = find_texture_targets(context, grouped, project_keys=project_keys)
             if not targets:
-                targets = [obj for obj in context.scene.objects if obj.type == "MESH"]
-                strict = True
+                all_meshes = [obj for obj in context.scene.objects if obj.type == "MESH"]
+                if len(all_meshes) == 1:
+                    targets = all_meshes
+                    strict = True
         if not targets and grouped:
             self.report(
                 {"WARNING"},
                 "No mesh targets found; match material or object names to texture sets",
+            )
+        if targets and primary_project_key:
+            tag_objects_with_project_key(
+                context,
+                targets,
+                primary_project_key,
+                clear_existing=bool(new_objects),
             )
         if texture_paths and targets:
             apply_textures_to_objects(targets, grouped, manifest=manifest, strict=strict)
