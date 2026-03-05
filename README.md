@@ -3,7 +3,7 @@ These scripts will allow you to export from Blender to Substance Painter and vic
 
 Make sure to install both of them.
 
-Virus checks: [bl2.1.py](https://www.virustotal.com/gui/file/d8ecba2af569fc5929f0c6be4b16521068c624d60353705f9b1f8263971766c4?nocache=1) - [sp2.1.py](https://www.virustotal.com/gui/file/9e96cb20e710d9cb518699534d55d4ee1bf6eb3946f80022d81a13f9d825e48c?nocache=1)
+Virus checks: [bl2.2.py](https://www.virustotal.com/gui/file/8293d13d91add1d5fdfdc51a9cb1ea8f75ae176417c3292ceb168bb4ca3f2ed9?nocache=1) - [sp2.1.py](https://www.virustotal.com/gui/file/9e96cb20e710d9cb518699534d55d4ee1bf6eb3946f80022d81a13f9d825e48c?nocache=1)
 
 ‎ 
 ‎ 
