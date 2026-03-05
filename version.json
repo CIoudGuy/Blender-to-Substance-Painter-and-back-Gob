@@ -1,7 +1,7 @@
 {
   "blender": {
-    "version": "0.2.1",
-    "download_url": "https://github.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/releases/download/v0.2.1-Blender%2FSP/gob_blender_0.2.1.zip"
+    "version": "0.2.2",
+    "download_url": "https://github.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/releases/download/v0.2.2-Blender/gob_blender_0.2.2.zip"
   },
   "substance_painter": {
     "version": "0.2.1",
