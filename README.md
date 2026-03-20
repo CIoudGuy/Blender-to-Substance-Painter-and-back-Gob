@@ -16,7 +16,7 @@ Virus checks: [bl2.2.py](https://www.virustotal.com/gui/file/8293d13d91add1d5fdf
 - Save your export presets (SP)
 - and many more
 
-‎Tested on Windows 11 / Blender 4.5 / Substance Painter v11.1.1
+‎Tested on Windows 11 / Blender 5.1 / Substance Painter v12.0.0
 
 Partially tested on macOs
 
