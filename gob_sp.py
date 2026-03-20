@@ -43,7 +43,7 @@ UPDATE_URL = (
 BUG_REPORT_URL = (
     "https://github.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/issues"
 )
-PLUGIN_VERSION = "0.2.1"
+PLUGIN_VERSION = "0.2.3"
 
 EXPORT_FORMATS = [
     ("png", "PNG"),
@@ -222,13 +222,7 @@ def default_bridge_dir():
     env_path = os.environ.get(BRIDGE_ENV_VAR)
     if env_path:
         return env_path
-    docs = QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.DocumentsLocation)
-    if docs:
-        return os.path.join(docs, "GoB_SP_Bridge")
-    win_docs = windows_documents_dir()
-    if win_docs:
-        return os.path.join(win_docs, "GoB_SP_Bridge")
-    return os.path.join(os.path.expanduser("~"), "Documents", "GoB_SP_Bridge")
+    return str(documents_bridge_root())
 
 
 def documents_bridge_root():
@@ -772,7 +766,7 @@ def is_temp_file(path, prefix, suffix):
     if not (name.startswith(prefix) and name.endswith(suffix)):
         return False
     try:
-        return normalize_path(path_obj.parent).lower() == normalize_path(bridge_temp_dir()).lower()
+        return normalize_path_key(path_obj.parent) == normalize_path_key(bridge_temp_dir())
     except Exception:
         return False
 
@@ -943,7 +937,8 @@ def normalize_path(path):
 
 
 def normalize_path_key(path):
-    return normalize_path(path).lower()
+    normalized = normalize_path(path)
+    return normalized.lower() if os.name == "nt" else normalized
 
 
 def link_registry_paths():
@@ -963,7 +958,7 @@ def link_registry_paths():
     unique = []
     seen = set()
     for root in roots:
-        key = str(root).lower()
+        key = normalize_path_key(root)
         if key in seen:
             continue
         seen.add(key)
@@ -1039,7 +1034,7 @@ def is_force_new_project_dir(project_dir):
 def paths_match(left, right):
     if not left or not right:
         return False
-    return normalize_path(left).lower() == normalize_path(right).lower()
+    return normalize_path_key(left) == normalize_path_key(right)
 
 
 def find_manifest_for_sp_project(bridge_roots, sp_project_file, source=None):
@@ -1284,7 +1279,7 @@ def active_sp_info_paths(project_dir=None):
     unique = []
     seen = set()
     for path in paths:
-        key = str(path).lower()
+        key = normalize_path_key(path)
         if key in seen:
             continue
         seen.add(key)
@@ -1335,7 +1330,7 @@ def active_blender_info_paths(project_dir=None):
     unique = []
     seen = set()
     for path in paths:
-        key = str(path).lower()
+        key = normalize_path_key(path)
         if key in seen:
             continue
         seen.add(key)
@@ -1442,7 +1437,7 @@ def get_candidate_bridge_roots():
     unique = []
     seen = set()
     for root in roots:
-        key = str(root).lower()
+        key = normalize_path_key(root)
         if key in seen:
             continue
         seen.add(key)
@@ -3090,10 +3085,109 @@ def set_auto_unwrap_flags(target):
     return handled
 
 
+def safe_project_is_open():
+    try:
+        return bool(sp.project.is_open())
+    except Exception:
+        return False
+
+
+def safe_project_is_in_edition_state():
+    try:
+        return bool(sp.project.is_in_edition_state())
+    except Exception:
+        return False
+
+
+def mark_auto_import_retry(delay=2.0):
+    global _auto_import_busy_until
+    _auto_import_busy_until = max(_auto_import_busy_until, time.time() + max(float(delay), 0.1))
+
+
+def mark_auto_import_processed(manifest_path, manifest=None):
+    global _auto_import_last_time
+    global _auto_import_last_path
+    if not manifest_path:
+        return
+    _auto_import_last_time = manifest_timestamp(manifest, manifest_path)
+    _auto_import_last_path = str(manifest_path)
+
+
+def is_transient_project_error(exc):
+    exception_module = getattr(sp, "exception", None)
+    service_not_found = getattr(exception_module, "ServiceNotFoundError", None)
+    if service_not_found and isinstance(exc, service_not_found):
+        return True
+    message = str(exc).lower()
+    transient_tokens = (
+        "busy",
+        "service",
+        "startup",
+        "starting",
+        "initialize",
+        "initializ",
+        "edition state",
+        "not ready",
+        "not started",
+    )
+    return any(token in message for token in transient_tokens)
+
+
+def schedule_import_when_not_busy(manifest_path=None, clear_auto_import=False):
+    execute_when_not_busy = getattr(sp.project, "execute_when_not_busy", None)
+    if not callable(execute_when_not_busy):
+        return False
+    manifest_key = str(manifest_path) if manifest_path else ""
+    key = (manifest_key, bool(clear_auto_import))
+    global _busy_import_callback_key
+    if _busy_import_callback_key == key:
+        return True
+    session_token = _plugin_runtime_token
+    expected_timestamp = None
+    if manifest_path:
+        expected_manifest = read_manifest(manifest_path)
+        if not expected_manifest or expected_manifest.get("source") != "blender":
+            return False
+        expected_timestamp = manifest_timestamp(expected_manifest, manifest_path)
+
+    def _invoke_import():
+        global _busy_import_callback_key
+        if _busy_import_callback_key == key:
+            _busy_import_callback_key = None
+        if not _plugin_active or session_token != _plugin_runtime_token:
+            return
+        if manifest_path:
+            current_manifest = read_manifest(manifest_path)
+            if not current_manifest or current_manifest.get("source") != "blender":
+                return
+            if expected_timestamp is not None:
+                current_timestamp = manifest_timestamp(current_manifest, manifest_path)
+                if current_timestamp != expected_timestamp:
+                    return
+        import_from_blender(
+            manifest_path=manifest_path,
+            clear_auto_import=clear_auto_import,
+        )
+
+    def _run_when_ready():
+        try:
+            QtCore.QTimer.singleShot(0, _invoke_import)
+        except Exception:
+            _invoke_import()
+
+    try:
+        _busy_import_callback_key = key
+        execute_when_not_busy(_run_when_ready)
+        return True
+    except Exception:
+        _busy_import_callback_key = None
+        return False
+
+
 def build_project_settings(settings_dict):
     if not settings_dict or not isinstance(settings_dict, dict):
         return None
-    settings_cls = getattr(sp.project, "ProjectSettings", None)
+    settings_cls = getattr(sp.project, "Settings", None) or getattr(sp.project, "ProjectSettings", None)
     if not settings_cls:
         return None
     try:
@@ -3101,7 +3195,15 @@ def build_project_settings(settings_dict):
     except Exception:
         return None
 
-    size_value = resolve_texture_size(settings_dict.get("document_resolution"))
+    document_resolution = settings_dict.get("document_resolution")
+    size_value = resolve_texture_size(document_resolution)
+    raw_size_value = None
+    try:
+        raw_size_value = int(document_resolution)
+    except (TypeError, ValueError):
+        raw_size_value = None
+    if raw_size_value is not None:
+        try_set_attr(settings, ["default_texture_resolution"], raw_size_value)
     if size_value is not None:
         try_set_attr(
             settings,
@@ -3131,10 +3233,23 @@ def build_project_settings(settings_dict):
 
     tangent = settings_dict.get("tangent_space_per_fragment")
     if tangent is not None:
+        tangent_value = bool(tangent)
+        tangent_enum = getattr(sp.project, "TangentSpace", None)
+        if tangent_enum:
+            tangent_resolved = resolve_enum_by_hints(
+                tangent_enum,
+                ["Fragment", "PerFragment"] if tangent_value else ["Vertex", "PerVertex"],
+            )
+            if tangent_resolved is not None:
+                tangent_value = tangent_resolved
         try_set_attr(
             settings,
-            ["tangent_space_per_fragment", "compute_tangent_space_per_fragment"],
-            bool(tangent),
+            [
+                "tangent_space_mode",
+                "tangent_space_per_fragment",
+                "compute_tangent_space_per_fragment",
+            ],
+            tangent_value,
         )
 
     use_uv_tiles = settings_dict.get("use_uv_tiles")
@@ -3153,6 +3268,33 @@ def build_project_settings(settings_dict):
     import_cameras = settings_dict.get("import_cameras")
     if import_cameras is not None:
         try_set_attr(settings, ["import_cameras", "import_camera"], bool(import_cameras))
+
+    project_workflow = settings_dict.get("project_workflow")
+    if project_workflow:
+        enum_cls = getattr(sp.project, "ProjectWorkflow", None)
+        workflow_value = resolve_enum_member(enum_cls, str(project_workflow)) if enum_cls else project_workflow
+        if workflow_value is None and enum_cls:
+            workflow_value = resolve_enum_member(enum_cls, str(project_workflow).title())
+        if workflow_value is None:
+            workflow_value = project_workflow
+        try_set_attr(settings, ["project_workflow", "workflow"], workflow_value)
+
+    mesh_unit_scale = settings_dict.get("mesh_unit_scale")
+    if mesh_unit_scale is not None:
+        try:
+            mesh_unit_scale = float(mesh_unit_scale)
+        except (TypeError, ValueError):
+            mesh_unit_scale = None
+        if mesh_unit_scale is not None:
+            try_set_attr(settings, ["mesh_unit_scale", "unit_scale"], mesh_unit_scale)
+
+    default_save_path = settings_dict.get("default_save_path")
+    if default_save_path:
+        try_set_attr(settings, ["default_save_path", "save_path"], str(default_save_path))
+
+    export_path = settings_dict.get("export_path")
+    if export_path:
+        try_set_attr(settings, ["export_path"], str(export_path))
 
     return settings
 
@@ -4328,7 +4470,7 @@ def manifest_timestamp(manifest, manifest_path):
 
 
 def manifest_targets_current_project(manifest, manifest_path):
-    if not sp.project.is_open():
+    if not safe_project_is_open():
         return True
     sp_project_file = get_sp_project_file_path_or_temp()
     manifest_sp_file = manifest.get("sp_project_file") or manifest.get("sp_project_path")
@@ -4388,8 +4530,8 @@ def should_accept_force_new_manifest(manifest):
     if token:
         if _force_new_token and token == _force_new_token:
             return True
-        return not sp.project.is_open()
-    return not sp.project.is_open()
+        return not safe_project_is_open()
+    return not safe_project_is_open()
 
 
 def import_from_blender(manifest_path=None, clear_auto_import=False):
@@ -4402,8 +4544,10 @@ def import_from_blender(manifest_path=None, clear_auto_import=False):
         if manifest_path.exists():
             manifest = read_manifest(manifest_path)
             project_dir = project_dir_from_manifest_path(manifest_path)
+            if manifest and manifest.get("source") != "blender":
+                manifest = None
     else:
-        sp_project_file = get_sp_project_file_path_or_temp() if sp.project.is_open() else ""
+        sp_project_file = get_sp_project_file_path_or_temp() if safe_project_is_open() else ""
         if sp_project_file:
             candidate = find_manifest_for_sp_project(
                 bridge_roots,
@@ -4423,13 +4567,13 @@ def import_from_blender(manifest_path=None, clear_auto_import=False):
             latest = find_latest_manifest(bridge_roots, source="blender")
             if not latest:
                 show_message("GoB Bridge", "No Blender export manifest found.", QtWidgets.QMessageBox.Warning)
-                return
+                return "failure"
             manifest_path = latest
             manifest = read_manifest(manifest_path)
             project_dir = project_dir_from_manifest_path(manifest_path)
     if not manifest:
         show_message("GoB Bridge", "Failed to read Blender export manifest.", QtWidgets.QMessageBox.Warning)
-        return
+        return "failure"
     linked_blender_file = str(manifest.get("blender_file") or "")
     project_name = sanitize_name(str(manifest.get("project") or ""))
 
@@ -4472,20 +4616,23 @@ def import_from_blender(manifest_path=None, clear_auto_import=False):
                 mesh_path = alt
     if not mesh_path or not Path(mesh_path).is_file():
         show_message("GoB Bridge", "Blender FBX file not found.", QtWidgets.QMessageBox.Warning)
-        return
+        return "failure"
 
-    if sp.project.is_open() and not force_new_project:
+    if safe_project_is_open() and not force_new_project:
         if not manifest_targets_current_project(manifest, manifest_path):
             if clear_auto_import:
-                return
+                return "failure"
             show_message(
                 "GoB Bridge",
                 "Blender export targets a different project. Close the current project and import again.",
                 QtWidgets.QMessageBox.Warning,
             )
-            return
-        if not sp.project.is_in_edition_state():
-            return
+            return "failure"
+        if not safe_project_is_in_edition_state():
+            if schedule_import_when_not_busy(manifest_path, clear_auto_import=clear_auto_import):
+                return "retry"
+            mark_auto_import_retry()
+            return "retry"
         def make_reload_settings(preserve):
             try:
                 return sp.project.MeshReloadingSettings(
@@ -4528,6 +4675,8 @@ def import_from_blender(manifest_path=None, clear_auto_import=False):
                 write_active_sp_info()
                 show_message("GoB Bridge", "Mesh reloaded from Blender.")
             else:
+                if clear_auto_import:
+                    mark_auto_import_processed(manifest_path, manifest)
                 show_message("GoB Bridge", "Mesh reload failed.", QtWidgets.QMessageBox.Warning)
 
         def _on_reload(status):
@@ -4550,21 +4699,25 @@ def import_from_blender(manifest_path=None, clear_auto_import=False):
         except Exception as exc:
             _auto_import_in_progress = False
             message = str(exc).lower()
-            if "busy" in message:
-                global _auto_import_busy_until
-                _auto_import_busy_until = time.time() + 2.0
-                return
+            if is_transient_project_error(exc):
+                if schedule_import_when_not_busy(manifest_path, clear_auto_import=clear_auto_import):
+                    return "retry"
+                mark_auto_import_retry()
+                return "retry"
             if (fallback_settings and settings and not attempted_fallback and
                     any(key in message for key in ("stroke", "preserv", "scale", "unit"))):
                 attempted_fallback = True
                 try:
                     _auto_import_in_progress = True
                     sp.project.reload_mesh(mesh_path, fallback_settings, _on_reload)
-                    return
+                    return "pending"
                 except Exception:
                     _auto_import_in_progress = False
+            if clear_auto_import:
+                mark_auto_import_processed(manifest_path, manifest)
             show_message("GoB Bridge", f"Mesh reload failed: {exc}", QtWidgets.QMessageBox.Warning)
-        return
+            return "failure"
+        return "pending"
 
     if force_new_project:
         if not should_accept_force_new_manifest(manifest):
@@ -4574,8 +4727,8 @@ def import_from_blender(manifest_path=None, clear_auto_import=False):
                     "New instance project detected for a different Painter instance.",
                     QtWidgets.QMessageBox.Warning,
                 )
-            return
-        if sp.project.is_open():
+            return "failure"
+        if safe_project_is_open():
             try:
                 sp.project.close()
             except Exception:
@@ -4583,17 +4736,25 @@ def import_from_blender(manifest_path=None, clear_auto_import=False):
     project_settings = build_project_settings(manifest.get("sp_project_settings"))
     try:
         _auto_import_in_progress = True
-        create_kwargs = {"mesh_file_path": mesh_path}
+        create_attempts = [{"mesh_file_path": mesh_path}]
         if project_settings:
-            create_kwargs["settings"] = project_settings
-        try:
-            sp.project.create(**create_kwargs)
-        except TypeError:
-            if "import_settings" in create_kwargs:
-                create_kwargs.pop("import_settings", None)
+            create_attempts.insert(0, {"mesh_file_path": mesh_path, "settings": project_settings})
+        last_exc = None
+        created = False
+        for create_kwargs in create_attempts:
+            try:
                 sp.project.create(**create_kwargs)
-            else:
+                created = True
+                break
+            except Exception as exc:
+                last_exc = exc
+                if is_transient_project_error(exc):
+                    raise
+                if "settings" in create_kwargs and isinstance(exc, (TypeError, ValueError)):
+                    continue
                 raise
+        if not created and last_exc is not None:
+            raise last_exc
         if force_new_project and force_new_token_matches(manifest):
             global _force_new_token
             _force_new_token = ""
@@ -4626,13 +4787,22 @@ def import_from_blender(manifest_path=None, clear_auto_import=False):
             write_manifest_sp_project_file(manifest, project_dir, sp_project_file)
         write_active_sp_info()
         _auto_import_in_progress = False
-    except Exception:
+        return "success"
+    except Exception as exc:
         _auto_import_in_progress = False
-        show_message("GoB Bridge", "Failed to create project from Blender mesh.", QtWidgets.QMessageBox.Warning)
+        if is_transient_project_error(exc):
+            if schedule_import_when_not_busy(manifest_path, clear_auto_import=clear_auto_import):
+                return "retry"
+            mark_auto_import_retry()
+            return "retry"
+        if clear_auto_import:
+            mark_auto_import_processed(manifest_path, manifest)
+        show_message("GoB Bridge", f"Failed to create project from Blender mesh:\n{exc}", QtWidgets.QMessageBox.Warning)
+        return "failure"
 
 
 def send_to_blender():
-    if not sp.project.is_open():
+    if not safe_project_is_open():
         show_message("GoB Bridge", "Open a project before exporting.", QtWidgets.QMessageBox.Warning)
         return
 
@@ -4966,6 +5136,9 @@ _auto_import_in_progress = False
 _auto_import_busy_until = 0.0
 _auto_import_last_scan = 0.0
 _auto_import_last_active_write = 0.0
+_busy_import_callback_key = None
+_plugin_active = False
+_plugin_runtime_token = 0
 AUTO_IMPORT_POLL_INTERVAL_MS = 3000
 AUTO_IMPORT_SCAN_COOLDOWN = 5.0
 AUTO_IMPORT_ACTIVE_WRITE_INTERVAL = 5.0
@@ -4974,6 +5147,10 @@ AUTO_IMPORT_ACTIVE_WRITE_INTERVAL = 5.0
 def start_plugin():
     global _force_new_token
     global _send_to_blender_action
+    global _plugin_active
+    global _plugin_runtime_token
+    _plugin_runtime_token += 1
+    _plugin_active = True
     _force_new_token = load_force_new_token()
     action_import = QtGui.QAction("GoB Bridge: Import from Blender")
     action_import.triggered.connect(import_from_blender)
@@ -5002,10 +5179,7 @@ def start_plugin():
     except Exception:
         pass
     def _auto_import_poll():
-        global _auto_import_last_time
-        global _auto_import_last_path
         global _auto_import_in_progress
-        global _auto_import_busy_until
         global _auto_import_last_scan
         global _auto_import_last_active_write
         now = time.time()
@@ -5044,15 +5218,14 @@ def start_plugin():
         if manifest.get("force_new_project"):
             if not should_accept_force_new_manifest(manifest):
                 return
-        elif sp.project.is_open():
+        elif safe_project_is_open():
             if not manifest_targets_current_project(manifest, manifest_path):
                 return
         if (str(manifest_path) == _auto_import_last_path and ts <= _auto_import_last_time):
             return
-        import_from_blender(manifest_path=manifest_path, clear_auto_import=True)
-        if not _auto_import_in_progress:
-            _auto_import_last_time = ts
-            _auto_import_last_path = str(manifest_path)
+        result = import_from_blender(manifest_path=manifest_path, clear_auto_import=True)
+        if result in {"success", "failure"}:
+            mark_auto_import_processed(manifest_path, manifest)
 
     global _auto_import_timer
     try:
@@ -5085,8 +5258,14 @@ def close_plugin():
     _auto_import_last_path = None
     global _auto_import_in_progress
     global _auto_import_busy_until
+    global _busy_import_callback_key
+    global _plugin_active
+    global _plugin_runtime_token
     _auto_import_in_progress = False
     _auto_import_busy_until = 0.0
+    _busy_import_callback_key = None
+    _plugin_active = False
+    _plugin_runtime_token += 1
     global _force_new_token
     _force_new_token = ""
     write_active_sp_info()

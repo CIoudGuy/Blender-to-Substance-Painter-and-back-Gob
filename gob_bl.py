@@ -1,7 +1,7 @@
 bl_info = {
     "name": "GoB SP Bridge",
     "author": "Cloud Guy | cloud_was_taken on Discord",
-    "version": (0, 2, 2),
+    "version": (0, 2, 3),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > GoB SP",
     "description": "Send FBX to Substance 3D Painter and import meshes/textures back",
@@ -22,6 +22,7 @@ import urllib.request
 from pathlib import Path
 
 import bpy
+from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, FloatProperty, StringProperty, PointerProperty
 from bpy.types import AddonPreferences, Operator, Panel
 
@@ -137,10 +138,7 @@ def default_bridge_dir():
     env_path = os.environ.get(BRIDGE_ENV_VAR)
     if env_path:
         return env_path
-    docs = windows_documents_dir()
-    if docs:
-        return str(Path(docs) / "GoB_SP_Bridge")
-    return str(Path.home() / "Documents" / "GoB_SP_Bridge")
+    return str(documents_bridge_root())
 
 
 def documents_bridge_root():
@@ -183,7 +181,8 @@ def normalize_path(path):
 
 
 def normalize_path_key(path):
-    return normalize_path(path).lower()
+    normalized = normalize_path(path)
+    return normalized.lower() if os.name == "nt" else normalized
 
 
 def temp_session_id():
@@ -240,7 +239,7 @@ def is_temp_file(path, prefix, suffix, prefs=None):
     if not (name.startswith(prefix) and name.endswith(suffix)):
         return False
     try:
-        return normalize_path(path_obj.parent).lower() == normalize_path(bridge_temp_dir(prefs)).lower()
+        return normalize_path_key(path_obj.parent) == normalize_path_key(bridge_temp_dir(prefs))
     except Exception:
         return False
 
@@ -414,7 +413,7 @@ def link_registry_paths(prefs=None):
     unique = []
     seen = set()
     for root in roots:
-        key = str(root).lower()
+        key = normalize_path_key(root)
         if key in seen:
             continue
         seen.add(key)
@@ -479,7 +478,7 @@ def update_link_registry(sp_project_file=None, blender_file=None, prefs=None):
 def paths_match(left, right):
     if not left or not right:
         return False
-    return normalize_path(left).lower() == normalize_path(right).lower()
+    return normalize_path_key(left) == normalize_path_key(right)
 
 
 def parse_suffixes(text):
@@ -574,7 +573,7 @@ def collect_low_poly_objects(context, prefs):
             return candidates
         if selected_only:
             return [obj for obj in search_pool if obj.type == "MESH"]
-    return [obj for obj in context.selected_objects if obj.type == "MESH"]
+    return [obj for obj in search_pool if obj.type == "MESH"]
 
 
 def get_prefs(context):
@@ -748,7 +747,7 @@ def active_blender_info_paths(prefs=None, project_dir=None):
     unique = []
     seen = set()
     for root in roots:
-        key = str(root).lower()
+        key = normalize_path_key(root)
         if key in seen:
             continue
         seen.add(key)
@@ -843,6 +842,7 @@ def sync_saved_blender_file(context=None, prefs=None):
     _last_blender_file = current
 
 
+@persistent
 def _update_active_blender_info(_context=None):
     try:
         context = bpy.context
@@ -888,7 +888,7 @@ def get_candidate_bridge_roots(prefs):
     unique = []
     seen = set()
     for root in roots:
-        key = str(root).lower()
+        key = normalize_path_key(root)
         if key in seen:
             continue
         seen.add(key)
@@ -1420,13 +1420,13 @@ def clear_cache_dir_except(root, keep_paths=None):
                     continue
             except OSError:
                 continue
-            keep.add(str(path_obj).lower())
+            keep.add(normalize_path_key(path_obj))
     try:
         for child in root.iterdir():
             try:
-                child_key = str(child.resolve()).lower()
+                child_key = normalize_path_key(child.resolve())
             except OSError:
-                child_key = str(child).lower()
+                child_key = normalize_path_key(child)
             if child.is_file() and child.name in {BRIDGE_ROOT_HINT_FILENAME, ACTIVE_SP_INFO_FILENAME}:
                 continue
             if child_key in keep:
@@ -2362,10 +2362,34 @@ def export_selected_fbx(filepath, prefs=None, strip_uvs=False):
     )
 
 
-def object_has_uvs(obj):
+def mesh_has_uvs(mesh):
+    if not mesh:
+        return False
+    try:
+        return bool(mesh.uv_layers)
+    except Exception:
+        return False
+
+
+def object_has_uvs(obj, depsgraph=None):
     if obj.type != "MESH":
         return False
-    return bool(obj.data.uv_layers)
+    if mesh_has_uvs(getattr(obj, "data", None)):
+        return True
+    try:
+        if depsgraph is None:
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+        evaluated_obj = obj.evaluated_get(depsgraph)
+        mesh = evaluated_obj.to_mesh()
+    except Exception:
+        return False
+    try:
+        return mesh_has_uvs(mesh)
+    finally:
+        try:
+            evaluated_obj.to_mesh_clear()
+        except Exception:
+            pass
 
 
 def mesh_triangle_count(obj):
@@ -2528,6 +2552,8 @@ def open_sp_project_file(project_file, sp_exe=None):
         if sys.platform == "darwin":
             if sp_exe and sp_exe.lower().endswith(".app"):
                 subprocess.Popen(["open", "-a", sp_exe, project_file])
+            elif sp_exe and Path(sp_exe).is_file():
+                subprocess.Popen([sp_exe, project_file])
             else:
                 subprocess.Popen(["open", project_file])
             return True
@@ -2969,6 +2995,7 @@ def refresh_cache_sizes(context, prefs):
     _cache_size_check_time = time.time()
 
 
+@persistent
 def _init_scene_ui_prefs(_context=None):
     prefs = get_prefs(bpy.context) if bpy.context else None
     default_show = prefs.ui_show_export_settings if prefs else True
@@ -3114,7 +3141,12 @@ class GOB_OT_SendToSP(Operator):
             self.report({"ERROR"}, "Select or name at least one low poly mesh")
             return {"CANCELLED"}
 
-        if low_objects and any(not object_has_uvs(obj) for obj in low_objects):
+        depsgraph = None
+        try:
+            depsgraph = context.evaluated_depsgraph_get()
+        except Exception:
+            depsgraph = None
+        if low_objects and any(not object_has_uvs(obj, depsgraph=depsgraph) for obj in low_objects):
             self.report({"ERROR"}, "Missing UVs: unwrap in Blender before export")
             return {"CANCELLED"}
 
@@ -3772,9 +3804,9 @@ def register():
     if _update_active_blender_info not in bpy.app.handlers.save_post:
         bpy.app.handlers.save_post.append(_update_active_blender_info)
     if not bpy.app.timers.is_registered(_init_scene_ui_prefs):
-        bpy.app.timers.register(_init_scene_ui_prefs, first_interval=0.1)
+        bpy.app.timers.register(_init_scene_ui_prefs, first_interval=0.1, persistent=True)
     if not bpy.app.timers.is_registered(_active_blender_heartbeat):
-        bpy.app.timers.register(_active_blender_heartbeat, first_interval=1.0)
+        bpy.app.timers.register(_active_blender_heartbeat, first_interval=1.0, persistent=True)
     start_update_check(show_popup=False)
 
 
