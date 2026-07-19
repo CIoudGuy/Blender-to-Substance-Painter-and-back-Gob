@@ -1,7 +1,7 @@
 bl_info = {
     "name": "GoB SP Bridge",
     "author": "Cloud Guy | cloud_was_taken on Discord",
-    "version": (0, 2, 3),
+    "version": (1, 0, 0),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > GoB SP",
     "description": "Send FBX to Substance 3D Painter and import meshes/textures back",
@@ -18,13 +18,15 @@ import threading
 import time
 import uuid
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 import bpy
 from bpy.app.handlers import persistent
-from bpy.props import BoolProperty, FloatProperty, StringProperty, PointerProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty, PointerProperty
 from bpy.types import AddonPreferences, Operator, Panel
+from mathutils import Vector
 
 
 BRIDGE_ENV_VAR = "GOB_SP_BRIDGE_DIR"
@@ -33,6 +35,7 @@ BRIDGE_SHARED_HINT_DIRNAME = ".gob_sp_bridge"
 MANIFEST_FILENAME = "bridge.json"
 BLENDER_EXPORT_FILENAME = "b2sp.fbx"
 BLENDER_HIGH_FILENAME = "b2sp_hi.fbx"
+BLENDER_CAGE_FILENAME = "b2sp_cage.fbx"
 SP_EXPORT_FILENAME = "sp2b.fbx"
 ACTIVE_SP_INFO_FILENAME = "active_sp.json"
 ACTIVE_BLENDER_INFO_FILENAME = "active_blender.json"
@@ -46,28 +49,27 @@ TEMP_BLENDER_SUFFIX = ".blend"
 ACTIVE_SP_INFO_MAX_AGE = 120.0
 ACTIVE_BLENDER_INFO_MAX_AGE = 120.0
 UPDATE_URL = (
-    "https://raw.githubusercontent.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/"
-    "refs/heads/main/version.json"
+    "https://files.devalt.cloud/api/app/blender-to-substance-painter-and-back-gob"
 )
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".tga", ".exr"}
 CACHE_WARN_BYTES = 35 * 1024 ** 3
 DEFAULT_CACHE_LIMIT_GB = 35.0
-UI_LINK_CACHE_TTL = 0.75
+UI_LINK_CACHE_TTL = 3.0
 OBJECT_PROJECT_KEY_PROP = "gob_sp_project_key"
 _temp_session_id = None
 _temp_blender_file = None
 _last_blender_file = None
+_blender_session_id = uuid.uuid4().hex[:12]
+_bridge_conflict_info = None
 _project_dir_cache = {}
 _ui_link_cache = {
     "timestamp": 0.0,
     "blender_file": "",
     "project_dir": "",
     "active_info": None,
-    "auto_sp_project": "",
     "linked_sp_project": "",
-    "auto_is_temp": False,
-    "auto_exists": False,
+    "sp_running": None,
 }
 
 MAP_KEYWORDS = [
@@ -442,16 +444,14 @@ def save_link_registry(data, prefs=None):
     primary = paths[0]
     ensure_dir(primary.parent)
     try:
-        with open(primary, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2, ensure_ascii=True)
+        write_json_atomic(primary, data)
     except OSError:
         return
     for path in paths[1:]:
         if not path.exists():
             continue
         try:
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump(data, handle, indent=2, ensure_ascii=True)
+            write_json_atomic(path, data)
         except OSError:
             continue
 
@@ -534,13 +534,17 @@ def collect_collection_meshes(collection, selected_only=False, selected_names=No
     for obj in objects:
         if obj.type != "MESH":
             continue
-        if selected_only and selected_names and obj.name not in selected_names:
+        if selected_only and selected_names is not None and obj.name not in selected_names:
             continue
         if obj.name in seen:
             continue
         seen.add(obj.name)
         results.append(obj)
     return results
+
+
+def get_identify_mode(scene):
+    return getattr(scene, "gob_sp_identify_mode", "SUFFIXES")
 
 
 def collect_low_poly_objects(context, prefs):
@@ -551,17 +555,18 @@ def collect_low_poly_objects(context, prefs):
         selected_names = {
             obj.name for obj in context.selected_objects if obj.type == "MESH"
         }
-    low_collection = getattr(scene, "gob_sp_low_poly_collection", None)
-    if not collection_in_scene(scene, low_collection):
-        low_collection = None
-    if low_collection:
-        collection_meshes = collect_collection_meshes(
-            low_collection,
-            selected_only=selected_only,
-            selected_names=selected_names,
-        )
-        if collection_meshes:
-            return collection_meshes
+    if get_identify_mode(scene) == "COLLECTIONS":
+        low_collection = getattr(scene, "gob_sp_low_poly_collection", None)
+        if not collection_in_scene(scene, low_collection):
+            low_collection = None
+        if low_collection:
+            collection_meshes = collect_collection_meshes(
+                low_collection,
+                selected_only=selected_only,
+                selected_names=selected_names,
+            )
+            if collection_meshes:
+                return collection_meshes
     suffixes = parse_suffixes(getattr(prefs, "low_poly_suffixes", ""))
     search_pool = context.selected_objects if selected_only else context.scene.objects
     if suffixes:
@@ -664,9 +669,23 @@ def ensure_dir(path):
     Path(path).mkdir(parents=True, exist_ok=True)
 
 
+def write_json_atomic(path, data):
+    path = Path(path)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=True)
+        os.replace(temp_path, path)
+    except OSError:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def write_manifest(path, data):
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2)
+    write_json_atomic(path, data)
 
 
 def read_manifest(path):
@@ -731,17 +750,13 @@ def find_active_sp_project_info(prefs, max_age=ACTIVE_SP_INFO_MAX_AGE):
 
 def active_blender_info_paths(prefs=None, project_dir=None):
     roots = []
+    try:
+        roots.append(Path(get_bridge_root(prefs)))
+    except (TypeError, ValueError):
+        pass
     docs_root = documents_bridge_root()
     if docs_root:
         roots.append(Path(docs_root))
-    for root in get_candidate_bridge_roots(prefs):
-        if not root:
-            continue
-        try:
-            root_path = Path(root)
-        except TypeError:
-            continue
-        roots.append(root_path)
     if project_dir:
         roots.append(project_meta_dir(project_dir))
     unique = []
@@ -756,6 +771,7 @@ def active_blender_info_paths(prefs=None, project_dir=None):
 
 
 def write_active_blender_info(context=None, prefs=None):
+    global _bridge_conflict_info
     if context is None:
         context = bpy.context
     if context is None:
@@ -767,6 +783,8 @@ def write_active_blender_info(context=None, prefs=None):
         "project_open": True,
         "project_name": get_project_name(context),
         "project_dir": str(project_dir),
+        "session_id": _blender_session_id,
+        "pid": os.getpid(),
     }
     blender_file = get_blender_file_path_or_temp(prefs)
     if blender_file:
@@ -774,6 +792,32 @@ def write_active_blender_info(context=None, prefs=None):
     for path in active_blender_info_paths(prefs, project_dir):
         try:
             ensure_dir(path.parent)
+            if _bridge_conflict_info is None:
+                previous = None
+                try:
+                    if path.is_file():
+                        with open(path, "r", encoding="utf-8") as handle:
+                            previous = json.load(handle)
+                except Exception:
+                    previous = None
+                if isinstance(previous, dict):
+                    previous_session = previous.get("session_id")
+                    previous_timestamp = previous.get("timestamp")
+                    try:
+                        previous_age = time.time() - float(previous_timestamp)
+                    except (TypeError, ValueError):
+                        previous_age = None
+                    if (
+                        previous_session
+                        and previous_session != _blender_session_id
+                        and previous_age is not None
+                        and previous_age < 45.0
+                    ):
+                        _bridge_conflict_info = {
+                            "session_id": previous_session,
+                            "pid": previous.get("pid"),
+                            "timestamp": previous_timestamp,
+                        }
             with open(path, "w", encoding="utf-8") as handle:
                 json.dump(info, handle, indent=2, ensure_ascii=True)
         except OSError:
@@ -800,7 +844,7 @@ def update_manifest_blender_file(old_blender_file, new_blender_file, prefs=None)
         write_manifest(target_path, manifest)
 
 
-def sync_saved_blender_file(context=None, prefs=None):
+def sync_saved_blender_file(context=None, prefs=None, after_save=False):
     global _last_blender_file
     if context is None:
         context = bpy.context
@@ -814,29 +858,30 @@ def sync_saved_blender_file(context=None, prefs=None):
         _last_blender_file = current
         return
     if current_real and not paths_match(current_real, _last_blender_file):
-        active_info = resolve_active_sp_project_info(context, prefs)
-        sp_project_file = ""
-        if active_info:
-            sp_project_file = str(active_info.get("sp_project_file") or "")
-        if not sp_project_file:
-            sp_project_file = get_linked_sp_project_path(
-                get_project_dir(context, prefs),
-                active_info=active_info,
-                blender_file=_last_blender_file,
-                prefs=prefs,
-            )
-        if sp_project_file:
-            update_link_registry(
-                sp_project_file=sp_project_file,
-                blender_file=current_real,
-                prefs=prefs,
-            )
-        update_manifest_blender_file(_last_blender_file, current_real, prefs=prefs)
-        project_dir = cached_project_dir(_last_blender_file)
-        if not project_dir:
-            project_dir = resolve_project_dir_for_blender(context, prefs, _last_blender_file)
-        if project_dir:
-            set_cached_project_dir(current_real, project_dir)
+        if after_save:
+            active_info = resolve_active_sp_project_info(context, prefs)
+            sp_project_file = ""
+            if active_info:
+                sp_project_file = str(active_info.get("sp_project_file") or "")
+            if not sp_project_file:
+                sp_project_file = get_linked_sp_project_path(
+                    get_project_dir(context, prefs),
+                    active_info=active_info,
+                    blender_file=_last_blender_file,
+                    prefs=prefs,
+                )
+            if sp_project_file:
+                update_link_registry(
+                    sp_project_file=sp_project_file,
+                    blender_file=current_real,
+                    prefs=prefs,
+                )
+            update_manifest_blender_file(_last_blender_file, current_real, prefs=prefs)
+            project_dir = cached_project_dir(_last_blender_file)
+            if not project_dir:
+                project_dir = resolve_project_dir_for_blender(context, prefs, _last_blender_file)
+            if project_dir:
+                set_cached_project_dir(current_real, project_dir)
         _last_blender_file = current_real
         return
     _last_blender_file = current
@@ -844,6 +889,17 @@ def sync_saved_blender_file(context=None, prefs=None):
 
 @persistent
 def _update_active_blender_info(_context=None):
+    try:
+        context = bpy.context
+        prefs = get_prefs(context) if context else None
+        sync_saved_blender_file(context, prefs, after_save=True)
+        write_active_blender_info(context, prefs)
+    except Exception:
+        pass
+    return None
+
+
+def _refresh_active_blender_info():
     try:
         context = bpy.context
         prefs = get_prefs(context) if context else None
@@ -855,7 +911,8 @@ def _update_active_blender_info(_context=None):
 
 
 def _active_blender_heartbeat():
-    _update_active_blender_info()
+    _refresh_active_blender_info()
+    _auto_clear_cache_tick()
     return 30.0
 
 
@@ -902,7 +959,11 @@ def find_latest_manifest(bridge_roots, source=None):
     for root in bridge_roots:
         if not root or not root.exists():
             continue
-        for candidate in root.rglob(MANIFEST_FILENAME):
+        try:
+            candidates = list(root.rglob(MANIFEST_FILENAME))
+        except OSError:
+            continue
+        for candidate in candidates:
             try:
                 mtime = candidate.stat().st_mtime
             except OSError:
@@ -925,7 +986,11 @@ def find_manifest_for_blender_file(bridge_roots, blender_file, source=None):
     for root in bridge_roots:
         if not root or not root.exists():
             continue
-        for candidate in root.rglob(MANIFEST_FILENAME):
+        try:
+            candidates = list(root.rglob(MANIFEST_FILENAME))
+        except OSError:
+            continue
+        for candidate in candidates:
             try:
                 mtime = candidate.stat().st_mtime
             except OSError:
@@ -952,7 +1017,11 @@ def find_manifest_for_sp_project_file(bridge_roots, sp_project_file, source=None
     for root in bridge_roots:
         if not root or not root.exists():
             continue
-        for candidate in root.rglob(MANIFEST_FILENAME):
+        try:
+            candidates = list(root.rglob(MANIFEST_FILENAME))
+        except OSError:
+            continue
+        for candidate in candidates:
             try:
                 mtime = candidate.stat().st_mtime
             except OSError:
@@ -1025,7 +1094,11 @@ def find_latest_saved_sp_project_for_blender(bridge_roots, blender_file):
     for root in bridge_roots:
         if not root or not root.exists():
             continue
-        for candidate in root.rglob(MANIFEST_FILENAME):
+        try:
+            candidates = list(root.rglob(MANIFEST_FILENAME))
+        except OSError:
+            continue
+        for candidate in candidates:
             try:
                 mtime = candidate.stat().st_mtime
             except OSError:
@@ -1058,7 +1131,11 @@ def find_manifest_for_mesh_signature(bridge_roots, blender_file, signature, sour
     for root in bridge_roots:
         if not root or not root.exists():
             continue
-        for candidate in root.rglob(MANIFEST_FILENAME):
+        try:
+            candidates = list(root.rglob(MANIFEST_FILENAME))
+        except OSError:
+            continue
+        for candidate in candidates:
             try:
                 mtime = candidate.stat().st_mtime
             except OSError:
@@ -1259,7 +1336,7 @@ def resolve_active_sp_project_info(context, prefs):
                 return active_info
         if not blender_file_is_temp:
             return None
-    if project_dir and active_info.get("project_dir") == project_dir:
+    if project_dir and paths_match(active_info.get("project_dir"), project_dir):
         return active_info
     if not blender_file_is_temp:
         current_name = get_project_name(context)
@@ -1392,14 +1469,73 @@ def project_cache_size_bytes(context, prefs):
     return folder_size_bytes(get_project_dir(context, prefs))
 
 
+def looks_like_bridge_root(path):
+    try:
+        path = Path(path)
+    except (TypeError, ValueError):
+        return False
+    try:
+        if path.name == documents_bridge_root().name:
+            return True
+        if (path / BRIDGE_ROOT_HINT_FILENAME).exists():
+            return True
+        if (path / PROJECT_META_DIRNAME).exists():
+            return True
+        if (path / TEMP_DIRNAME).exists():
+            return True
+    except OSError:
+        return False
+    return False
+
+
+def looks_like_bridge_project_dir(path):
+    try:
+        if (path / PROJECT_META_DIRNAME).is_dir():
+            return True
+        if (path / MANIFEST_FILENAME).is_file():
+            return True
+    except OSError:
+        return False
+    return False
+
+
+def clear_cache_dir_conservative(root):
+    keep_names = {
+        BRIDGE_ROOT_HINT_FILENAME,
+        ACTIVE_SP_INFO_FILENAME,
+        ACTIVE_BLENDER_INFO_FILENAME,
+        LINKS_FILENAME,
+        TEMP_DIRNAME,
+    }
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return "error"
+    for child in children:
+        if child.name in keep_names:
+            continue
+        try:
+            if child.is_dir():
+                if not looks_like_bridge_project_dir(child):
+                    continue
+                shutil.rmtree(child)
+        except OSError:
+            return "error"
+    ensure_dir(root)
+    return "cleared"
+
+
 def clear_cache_dir(path):
     if not path.exists():
         return "empty"
+    if not looks_like_bridge_root(path):
+        return clear_cache_dir_conservative(path)
     try:
         shutil.rmtree(path)
     except OSError:
         return "error"
     ensure_dir(path)
+    _project_dir_cache.clear()
     return "cleared"
 
 
@@ -1427,7 +1563,14 @@ def clear_cache_dir_except(root, keep_paths=None):
                 child_key = normalize_path_key(child.resolve())
             except OSError:
                 child_key = normalize_path_key(child)
-            if child.is_file() and child.name in {BRIDGE_ROOT_HINT_FILENAME, ACTIVE_SP_INFO_FILENAME}:
+            if child.is_file() and child.name in {
+                BRIDGE_ROOT_HINT_FILENAME,
+                ACTIVE_SP_INFO_FILENAME,
+                ACTIVE_BLENDER_INFO_FILENAME,
+                LINKS_FILENAME,
+            }:
+                continue
+            if child.is_dir() and child.name == TEMP_DIRNAME:
                 continue
             if child_key in keep:
                 continue
@@ -1441,6 +1584,7 @@ def clear_cache_dir_except(root, keep_paths=None):
     except OSError:
         return "error"
     ensure_dir(root)
+    _project_dir_cache.clear()
     return "cleared"
 
 
@@ -1482,21 +1626,36 @@ def is_version_newer(remote, local):
 
 
 def check_for_updates():
+    local_version = local_version_string()
+    url = UPDATE_URL + "?current=" + urllib.parse.quote(local_version, safe="")
+    # The edge blocks urllib's default User-Agent (403); identify like the
+    # Substance Painter plugin does.
+    request = urllib.request.Request(
+        url, headers={"User-Agent": f"GoBBridge/{local_version}"}
+    )
     try:
-        with urllib.request.urlopen(UPDATE_URL, timeout=4) as response:
+        with urllib.request.urlopen(request, timeout=4) as response:
             data = json.load(response)
     except (OSError, json.JSONDecodeError, urllib.error.URLError) as exc:
         return {"status": "error", "error": str(exc)}
     if not isinstance(data, dict):
         return {"status": "error", "error": "Invalid update data"}
-    blender_info = data.get("blender") or {}
-    if not isinstance(blender_info, dict):
-        return {"status": "error", "error": "Missing Blender update data"}
-    remote_version = str(blender_info.get("version") or "").strip()
-    if not remote_version:
+    remote_version = str(data.get("version") or "").strip()
+    download_url = ""
+    files = data.get("files")
+    if isinstance(files, list):
+        for entry in files:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "")
+            if name.lower().startswith("gob_blender"):
+                download_url = str(entry.get("url") or "")
+                break
+    if not download_url:
+        download_url = str(data.get("page") or "")
+    if not remote_version and not download_url:
         return {"status": "error", "error": "Missing remote version"}
-    local_version = local_version_string()
-    if not is_version_newer(remote_version, local_version):
+    if not remote_version or not is_version_newer(remote_version, local_version):
         return {
             "status": "none",
             "local_version": local_version,
@@ -1506,7 +1665,7 @@ def check_for_updates():
         "status": "update",
         "info": {
             "version": remote_version,
-            "download_url": blender_info.get("download_url"),
+            "download_url": download_url or None,
             "notes": data.get("notes"),
             "local_version": local_version,
         },
@@ -1713,7 +1872,8 @@ def load_image(path):
 
 def build_material(mat, maps, normal_y_invert=False, manifest=None):
     mat["gob_bridge_material"] = True
-    mat.use_nodes = True
+    if hasattr(mat, "use_nodes"):
+        mat.use_nodes = True
     if hasattr(mat, "blend_method"):
         mat.blend_method = "OPAQUE"
     if hasattr(mat, "shadow_method"):
@@ -1815,29 +1975,29 @@ def build_material(mat, maps, normal_y_invert=False, manifest=None):
     roughness_output = roughness_node.outputs["Color"] if roughness_node else None
     specular_output = specular_node.outputs["Color"] if specular_node else None
     if orm_node:
-        separate = nodes.new("ShaderNodeSeparateRGB")
+        separate = nodes.new("ShaderNodeSeparateColor")
         separate.location = (-220, -300)
-        links.new(orm_node.outputs["Color"], separate.inputs["Image"])
+        links.new(orm_node.outputs["Color"], separate.inputs["Color"])
         if ao_output is None:
-            ao_output = separate.outputs["R"]
+            ao_output = separate.outputs["Red"]
         if roughness_output is None:
-            roughness_output = separate.outputs["G"]
+            roughness_output = separate.outputs["Green"]
         if metallic_output is None:
-            metallic_output = separate.outputs["B"]
+            metallic_output = separate.outputs["Blue"]
     if metallic_roughness_node:
-        separate = nodes.new("ShaderNodeSeparateRGB")
+        separate = nodes.new("ShaderNodeSeparateColor")
         separate.location = (-220, -120)
-        links.new(metallic_roughness_node.outputs["Color"], separate.inputs["Image"])
+        links.new(metallic_roughness_node.outputs["Color"], separate.inputs["Color"])
         if roughness_output is None:
-            roughness_output = separate.outputs["G"]
+            roughness_output = separate.outputs["Green"]
         if metallic_output is None:
-            metallic_output = separate.outputs["B"]
+            metallic_output = separate.outputs["Blue"]
     if metallic_smoothness_node:
-        separate = nodes.new("ShaderNodeSeparateRGB")
+        separate = nodes.new("ShaderNodeSeparateColor")
         separate.location = (-220, -180)
-        links.new(metallic_smoothness_node.outputs["Color"], separate.inputs["Image"])
+        links.new(metallic_smoothness_node.outputs["Color"], separate.inputs["Color"])
         if metallic_output is None:
-            metallic_output = separate.outputs["R"]
+            metallic_output = separate.outputs["Red"]
         if roughness_output is None:
             invert = nodes.new("ShaderNodeInvert")
             invert.inputs["Fac"].default_value = 1.0
@@ -1845,13 +2005,13 @@ def build_material(mat, maps, normal_y_invert=False, manifest=None):
             links.new(metallic_smoothness_node.outputs["Alpha"], invert.inputs["Color"])
             roughness_output = invert.outputs["Color"]
     if mask_node:
-        separate = nodes.new("ShaderNodeSeparateRGB")
+        separate = nodes.new("ShaderNodeSeparateColor")
         separate.location = (-220, -240)
-        links.new(mask_node.outputs["Color"], separate.inputs["Image"])
+        links.new(mask_node.outputs["Color"], separate.inputs["Color"])
         if metallic_output is None:
-            metallic_output = separate.outputs["R"]
+            metallic_output = separate.outputs["Red"]
         if ao_output is None:
-            ao_output = separate.outputs["G"]
+            ao_output = separate.outputs["Green"]
         if roughness_output is None:
             invert = nodes.new("ShaderNodeInvert")
             invert.inputs["Fac"].default_value = 1.0
@@ -1921,18 +2081,18 @@ def build_material(mat, maps, normal_y_invert=False, manifest=None):
         normal_map = nodes.new("ShaderNodeNormalMap")
         normal_map.location = (-50, -520)
         if normal_y_invert:
-            separate = nodes.new("ShaderNodeSeparateRGB")
+            separate = nodes.new("ShaderNodeSeparateColor")
             separate.location = (-250, -520)
             invert = nodes.new("ShaderNodeInvert")
             invert.location = (-200, -640)
-            combine = nodes.new("ShaderNodeCombineRGB")
+            combine = nodes.new("ShaderNodeCombineColor")
             combine.location = (-100, -520)
-            links.new(normal_node.outputs["Color"], separate.inputs["Image"])
-            links.new(separate.outputs["R"], combine.inputs["R"])
-            links.new(separate.outputs["G"], invert.inputs["Color"])
-            links.new(invert.outputs["Color"], combine.inputs["G"])
-            links.new(separate.outputs["B"], combine.inputs["B"])
-            links.new(combine.outputs["Image"], normal_map.inputs["Color"])
+            links.new(normal_node.outputs["Color"], separate.inputs["Color"])
+            links.new(separate.outputs["Red"], combine.inputs["Red"])
+            links.new(separate.outputs["Green"], invert.inputs["Color"])
+            links.new(invert.outputs["Color"], combine.inputs["Green"])
+            links.new(separate.outputs["Blue"], combine.inputs["Blue"])
+            links.new(combine.outputs["Color"], normal_map.inputs["Color"])
         else:
             links.new(normal_node.outputs["Color"], normal_map.inputs["Color"])
         links.new(normal_map.outputs["Normal"], principled.inputs["Normal"])
@@ -1962,7 +2122,8 @@ def build_material(mat, maps, normal_y_invert=False, manifest=None):
 
     if opacity_output:
         links.new(opacity_output, principled.inputs["Alpha"])
-        mat.blend_method = "CLIP"
+        if hasattr(mat, "blend_method"):
+            mat.blend_method = "CLIP"
         if hasattr(mat, "alpha_threshold"):
             mat.alpha_threshold = 0.5
         if hasattr(mat, "show_transparent_back"):
@@ -2115,8 +2276,6 @@ def build_fbx_export_kwargs(prefs):
     set_if("global_scale", max(0.0001, float(prefs.fbx_export_scale)))
     set_if("apply_unit_scale", bool(prefs.fbx_apply_unit_scale))
     set_if("apply_scale_options", "FBX_SCALE_UNITS")
-    if not prefs.fbx_export_custom_normals:
-        set_if("use_custom_normals", False)
     return kwargs
 
 
@@ -2187,8 +2346,13 @@ def export_fbx_objects(filepath, objects, prefs=None, strip_uvs=False):
             obj_key = id(obj)
         if obj_key not in seen_objs:
             seen_objs.add(obj_key)
+            try:
+                was_hidden_view = obj.hide_get()
+            except Exception:
+                was_hidden_view = False
             obj_states.append((
                 obj,
+                was_hidden_view,
                 getattr(obj, "hide_viewport", False),
                 getattr(obj, "hide_render", False),
                 getattr(obj, "hide_select", False),
@@ -2273,6 +2437,7 @@ def export_fbx_objects(filepath, objects, prefs=None, strip_uvs=False):
     if export_objs:
         bpy.context.view_layer.objects.active = export_objs[0]
     export_kwargs = build_fbx_export_kwargs(prefs)
+    export_ok = True
     try:
         bpy.ops.export_scene.fbx(
             filepath=str(filepath),
@@ -2283,6 +2448,8 @@ def export_fbx_objects(filepath, objects, prefs=None, strip_uvs=False):
             bake_space_transform=False,
             **export_kwargs,
         )
+    except Exception:
+        export_ok = False
     finally:
         for layer, was_excluded, was_hidden in layer_states:
             try:
@@ -2306,9 +2473,13 @@ def export_fbx_objects(filepath, objects, prefs=None, strip_uvs=False):
                 collection.hide_select = was_select
             except Exception:
                 pass
-        for obj, was_hidden, was_render, was_select in obj_states:
+        for obj, was_hidden_view, was_hidden, was_render, was_select in obj_states:
             if not object_is_valid(obj):
                 continue
+            try:
+                obj.hide_set(was_hidden_view)
+            except Exception:
+                pass
             try:
                 obj.hide_viewport = was_hidden
             except Exception:
@@ -2350,7 +2521,7 @@ def export_fbx_objects(filepath, objects, prefs=None, strip_uvs=False):
             except ReferenceError:
                 continue
         bpy.context.view_layer.objects.active = prev_active
-    return True
+    return export_ok
 
 
 def export_selected_fbx(filepath, prefs=None, strip_uvs=False):
@@ -2406,33 +2577,447 @@ def mesh_triangle_count(obj):
             return 0
 
 
-def split_meshes_by_triangles(objects):
-    mesh_items = [(obj, mesh_triangle_count(obj)) for obj in objects if obj.type == "MESH"]
-    if not mesh_items:
-        return [], []
-    if len(mesh_items) == 1:
-        return [mesh_items[0][0]], []
-    mesh_items.sort(key=lambda item: item[1])
-    if mesh_items[0][1] == mesh_items[-1][1]:
-        return [obj for obj, _ in mesh_items], []
-    best_index = 0
-    best_gap = -1
-    for idx in range(len(mesh_items) - 1):
-        gap = mesh_items[idx + 1][1] - mesh_items[idx][1]
-        if gap > best_gap:
-            best_gap = gap
-            best_index = idx
-    low = [obj for obj, _ in mesh_items[:best_index + 1]]
-    high = [obj for obj, _ in mesh_items[best_index + 1:]]
-    return low, high
+_tri_count_cache = {}
+_obj_info_cache = {}
+_export_plan_cache = {"key": None, "plan": None}
 
 
-def collect_high_poly_objects(context, prefs, low_objects):
-    candidates = collect_high_poly_candidates(context, prefs)
-    if not low_objects:
-        return candidates
-    low_set = {obj.name for obj in low_objects}
-    return [obj for obj in candidates if obj.name not in low_set]
+def evaluated_triangle_count(obj, depsgraph=None):
+    key = None
+    try:
+        key = (obj.name, obj.data.as_pointer())
+    except Exception:
+        key = None
+    if key is not None and key in _tri_count_cache:
+        return _tri_count_cache[key]
+    try:
+        if depsgraph is None:
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+        evaluated_obj = obj.evaluated_get(depsgraph)
+        mesh = evaluated_obj.to_mesh()
+        try:
+            mesh.calc_loop_triangles()
+            count = len(mesh.loop_triangles)
+        finally:
+            try:
+                evaluated_obj.to_mesh_clear()
+            except Exception:
+                pass
+    except Exception:
+        count = mesh_triangle_count(obj)
+    if key is not None:
+        _tri_count_cache[key] = count
+    return count
+
+
+def autosplit_obj_info(obj, depsgraph=None):
+    key = None
+    try:
+        key = (obj.name, obj.data.as_pointer())
+    except Exception:
+        key = None
+    if key is not None and key in _obj_info_cache:
+        return _obj_info_cache[key]
+    count = evaluated_triangle_count(obj, depsgraph)
+    bbox = None
+    try:
+        if depsgraph is None:
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+        evaluated_obj = obj.evaluated_get(depsgraph)
+        corners = [
+            evaluated_obj.matrix_world @ Vector(corner)
+            for corner in evaluated_obj.bound_box
+        ]
+        bbox = (
+            min(corner.x for corner in corners),
+            min(corner.y for corner in corners),
+            min(corner.z for corner in corners),
+            max(corner.x for corner in corners),
+            max(corner.y for corner in corners),
+            max(corner.z for corner in corners),
+        )
+    except Exception:
+        bbox = None
+    has_subsurf = False
+    try:
+        has_subsurf = any(
+            mod and mod.type in {"SUBSURF", "MULTIRES"} and mod.show_viewport
+            for mod in obj.modifiers
+        )
+    except Exception:
+        has_subsurf = False
+    info = {"count": count, "bbox": bbox, "has_subsurf": has_subsurf}
+    if key is not None:
+        _obj_info_cache[key] = info
+    return info
+
+
+def matched_name_suffix(name, suffixes):
+    lname = name.lower()
+    for suffix in suffixes:
+        if lname.endswith(suffix):
+            return suffix
+    return ""
+
+
+def bbox_intersects(left, right):
+    return (
+        left[0] <= right[3] and right[0] <= left[3]
+        and left[1] <= right[4] and right[1] <= left[4]
+        and left[2] <= right[5] and right[2] <= left[5]
+    )
+
+
+def spatial_clusters(meshes, infos):
+    padded = {}
+    for obj in meshes:
+        bbox = infos[obj.name]["bbox"]
+        if not bbox:
+            continue
+        pad_x = max(0.02 * (bbox[3] - bbox[0]), 0.0)
+        pad_y = max(0.02 * (bbox[4] - bbox[1]), 0.0)
+        pad_z = max(0.02 * (bbox[5] - bbox[2]), 0.0)
+        padded[obj.name] = (
+            bbox[0] - pad_x,
+            bbox[1] - pad_y,
+            bbox[2] - pad_z,
+            bbox[3] + pad_x,
+            bbox[4] + pad_y,
+            bbox[5] + pad_z,
+        )
+    names = sorted(padded)
+    parent = {name: name for name in names}
+
+    def find(name):
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    for index, name_a in enumerate(names):
+        for name_b in names[index + 1:]:
+            if bbox_intersects(padded[name_a], padded[name_b]):
+                root_a = find(name_a)
+                root_b = find(name_b)
+                if root_a != root_b:
+                    parent[root_b] = root_a
+    obj_by_name = {obj.name: obj for obj in meshes}
+    clusters = {}
+    for name in names:
+        clusters.setdefault(find(name), []).append(obj_by_name[name])
+    return [cluster for cluster in clusters.values() if len(cluster) >= 2]
+
+
+def classify_low_high(context, objects, depsgraph=None, method="SMART"):
+    meshes = [obj for obj in objects if obj and obj.type == "MESH"]
+    if not meshes:
+        return [], [], ["No meshes selected"], {}
+    reasons = {}
+    if len(meshes) == 1:
+        reasons[meshes[0].name] = "only mesh"
+        return [meshes[0]], [], [], reasons
+    if depsgraph is None:
+        try:
+            depsgraph = context.evaluated_depsgraph_get()
+        except Exception:
+            depsgraph = None
+    prefs = get_prefs(context)
+    low_suffixes = parse_suffixes(getattr(prefs, "low_poly_suffixes", "")) or ["_low"]
+    high_suffixes = parse_suffixes(getattr(prefs, "high_poly_suffixes", "")) or ["_high"]
+
+    def strip_base(name):
+        base = re.sub(r"\.\d+$", "", name.lower())
+        for suffix in low_suffixes + high_suffixes:
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        base = re.sub(r"_lod\d+$", "", base)
+        base = re.sub(r"_\d+$", "", base)
+        return base
+
+    infos = {obj.name: autosplit_obj_info(obj, depsgraph) for obj in meshes}
+    counts = {name: info["count"] for name, info in infos.items()}
+    warnings = []
+
+    def name_groups(items):
+        groups = {}
+        for obj in items:
+            groups.setdefault(strip_base(obj.name), []).append(obj)
+        return groups
+
+    def gap_split(items):
+        items = sorted(items, key=lambda obj: (counts[obj.name], obj.name))
+        if len(items) < 2:
+            return list(items), [], False
+        sorted_counts = [counts[obj.name] for obj in items]
+        if sorted_counts[0] == sorted_counts[-1]:
+            return list(items), [], False
+        best_index = 0
+        best_gap = -1
+        for idx in range(len(items) - 1):
+            gap = sorted_counts[idx + 1] - sorted_counts[idx]
+            if gap > best_gap:
+                best_gap = gap
+                best_index = idx
+        count_below = sorted_counts[best_index]
+        count_above = sorted_counts[best_index + 1]
+        ratio = count_above / count_below if count_below > 0 else float("inf")
+        if ratio < 2.0:
+            return list(items), [], False
+        return list(items[: best_index + 1]), list(items[best_index + 1:]), True
+
+    if method == "NAMES":
+        low = []
+        high = []
+        unpaired = []
+        for group in name_groups(meshes).values():
+            lows = [obj for obj in group if is_name_with_suffix(obj.name, low_suffixes)]
+            highs = [obj for obj in group if is_name_with_suffix(obj.name, high_suffixes)]
+            if len(group) == 2 and len(lows) == 1 and len(highs) == 1:
+                low_obj = lows[0]
+                high_obj = highs[0]
+                low.append(low_obj)
+                high.append(high_obj)
+                reasons[low_obj.name] = f"name says {matched_name_suffix(low_obj.name, low_suffixes)}"
+                reasons[high_obj.name] = f"name says {matched_name_suffix(high_obj.name, high_suffixes)}"
+                if counts[low_obj.name] > counts[high_obj.name]:
+                    warnings.append(f"{low_obj.name} has more triangles than {high_obj.name}")
+            else:
+                unpaired.extend(group)
+        if unpaired:
+            warnings.append("Unpaired meshes export as low")
+            for obj in unpaired:
+                low.append(obj)
+                reasons[obj.name] = "unpaired name"
+        return low, high, warnings, reasons
+
+    if method == "TRIANGLES":
+        if len({counts[obj.name] for obj in meshes}) == 1:
+            for obj in meshes:
+                reasons[obj.name] = "same triangle count"
+            return list(meshes), [], warnings, reasons
+        gap_low, gap_high, gap_found = gap_split(meshes)
+        if not gap_found:
+            warnings.append("No clear low/high separation, everything exports as low")
+            for obj in meshes:
+                reasons[obj.name] = "no clear separation"
+            return list(meshes), [], warnings, reasons
+        for obj in gap_low:
+            reasons[obj.name] = "gap split: low"
+        for obj in gap_high:
+            reasons[obj.name] = "gap split: high"
+        return gap_low, gap_high, warnings, reasons
+
+    locked = {}
+    for obj in meshes:
+        try:
+            tagged = bool(obj.get("gob_high_poly"))
+        except Exception:
+            tagged = False
+        if tagged:
+            locked[obj.name] = "high"
+            reasons[obj.name] = "tagged as high poly"
+    for obj in meshes:
+        if obj.name in locked:
+            continue
+        low_suffix = matched_name_suffix(obj.name, low_suffixes)
+        high_suffix = matched_name_suffix(obj.name, high_suffixes)
+        if low_suffix and not high_suffix:
+            locked[obj.name] = "low"
+            reasons[obj.name] = f"name says {low_suffix}"
+        elif high_suffix:
+            locked[obj.name] = "high"
+            reasons[obj.name] = f"name says {high_suffix}"
+    for group in name_groups(meshes).values():
+        for low_obj in [obj for obj in group if locked.get(obj.name) == "low"]:
+            for high_obj in [obj for obj in group if locked.get(obj.name) == "high"]:
+                if counts[low_obj.name] >= 2 * max(1, counts[high_obj.name]):
+                    warnings.append(f"{low_obj.name} has more triangles than {high_obj.name}")
+    remaining = [obj for obj in meshes if obj.name not in locked]
+    unpaired = []
+    for group in name_groups(remaining).values():
+        if len(group) == 2:
+            first, second = sorted(group, key=lambda obj: (counts[obj.name], obj.name))
+            if counts[first.name] == counts[second.name]:
+                warnings.append(
+                    f"{first.name} and {second.name} have equal triangle counts, both export as low"
+                )
+                locked[first.name] = "low"
+                locked[second.name] = "low"
+                reasons[first.name] = f"paired by name with {second.name}, equal counts"
+                reasons[second.name] = f"paired by name with {first.name}, equal counts"
+            else:
+                locked[first.name] = "low"
+                locked[second.name] = "high"
+                reasons[first.name] = f"paired by name with {second.name}"
+                reasons[second.name] = f"paired by name with {first.name}"
+        else:
+            unpaired.extend(group)
+    clustered_names = set()
+    for cluster in spatial_clusters(unpaired, infos):
+        ordered = sorted(cluster, key=lambda obj: (counts[obj.name], obj.name))
+        lightest = ordered[0]
+        locked[lightest.name] = "low"
+        clustered_names.add(lightest.name)
+        reasons[lightest.name] = f"shares space with {ordered[1].name}, lighter"
+        for obj in ordered[1:]:
+            locked[obj.name] = "high"
+            clustered_names.add(obj.name)
+            reasons[obj.name] = f"shares space with {lightest.name}, heavier"
+    singles = [obj for obj in unpaired if obj.name not in clustered_names]
+    leftover = []
+    for obj in singles:
+        if infos[obj.name]["has_subsurf"]:
+            locked[obj.name] = "high"
+            reasons[obj.name] = "has subdivision modifier"
+        else:
+            leftover.append(obj)
+    if leftover:
+        gap_low, gap_high, gap_found = gap_split(leftover)
+        if gap_found:
+            for obj in gap_low:
+                locked[obj.name] = "low"
+                reasons[obj.name] = "gap split: low"
+            for obj in gap_high:
+                locked[obj.name] = "high"
+                reasons[obj.name] = "gap split: high"
+        else:
+            equal_counts = len({counts[obj.name] for obj in leftover}) == 1
+            if not equal_counts:
+                warnings.append("No clear separation, exports as low")
+            for obj in leftover:
+                locked[obj.name] = "low"
+                reasons[obj.name] = "same triangle count" if equal_counts else "no clear separation"
+    low = []
+    high = []
+    for obj in meshes:
+        if locked.get(obj.name) == "high":
+            high.append(obj)
+        else:
+            low.append(obj)
+        reasons.setdefault(obj.name, "exports as low")
+    return low, high, warnings, reasons
+
+
+def build_export_plan(context, prefs, deep=False):
+    scene = context.scene
+    mode = get_identify_mode(scene)
+    warnings = []
+    reasons = {}
+    depsgraph = None
+    try:
+        depsgraph = context.evaluated_depsgraph_get()
+    except Exception:
+        depsgraph = None
+    if mode == "AUTO_SPLIT":
+        selected_only = bool(prefs and getattr(prefs, "export_selected_only", False))
+        pool = context.selected_objects if selected_only else scene.objects
+        method = getattr(scene, "gob_sp_autosplit_method", "SMART")
+        low, high, warnings, reasons = classify_low_high(
+            context,
+            pool,
+            depsgraph,
+            method=method,
+        )
+    else:
+        low = collect_low_poly_objects(context, prefs)
+        high = []
+        if prefs and getattr(prefs, "export_high_poly", False):
+            high = collect_high_poly_candidates(context, prefs)
+            if high and low:
+                high_names = {obj.name for obj in high}
+                low = [obj for obj in low if obj.name not in high_names]
+    cage = []
+    if prefs and getattr(prefs, "export_cage_poly", False):
+        cage = collect_cage_objects(context, prefs)
+        if cage:
+            cage_names = {obj.name for obj in cage}
+            low = [obj for obj in low if obj.name not in cage_names]
+            high = [obj for obj in high if obj.name not in cage_names]
+        else:
+            warnings.append("Cage export enabled but no cage meshes identified")
+    if prefs and getattr(prefs, "export_low_poly", False) and not low and not warnings:
+        warnings.append("No low poly meshes found")
+    if (
+        prefs and getattr(prefs, "export_high_poly", False)
+        and not high and low and mode != "AUTO_SPLIT"
+    ):
+        warnings.append("No high poly meshes identified, sending low only")
+    auto_unwrap = bool(prefs and getattr(prefs, "sp_auto_unwrap", False))
+    if not auto_unwrap and prefs and getattr(prefs, "export_low_poly", False) and low:
+        if deep:
+            missing_uvs = [
+                obj for obj in low if not object_has_uvs(obj, depsgraph=depsgraph)
+            ]
+        else:
+            missing_uvs = [
+                obj for obj in low if not mesh_has_uvs(getattr(obj, "data", None))
+            ]
+        if missing_uvs:
+            warnings.append(
+                f"Missing UVs on {len(missing_uvs)} low mesh(es), unwrap before export"
+            )
+    effective_high = bool(prefs and getattr(prefs, "export_high_poly", False)) and bool(high)
+    return {
+        "low": low,
+        "high": high,
+        "cage": cage,
+        "warnings": warnings,
+        "effective_high": effective_high,
+        "reasons": reasons,
+    }
+
+
+def _export_plan_cache_key(context, prefs):
+    scene = context.scene
+    selected_only = bool(getattr(prefs, "export_selected_only", False))
+    selected = None
+    if selected_only:
+        selected = tuple(sorted(
+            obj.name for obj in context.selected_objects if obj.type == "MESH"
+        ))
+    low_collection = getattr(scene, "gob_sp_low_poly_collection", None)
+    high_collection = getattr(scene, "gob_sp_high_poly_collection", None)
+    cage_collection = getattr(scene, "gob_sp_cage_collection", None)
+    return (
+        selected,
+        len(scene.objects),
+        get_identify_mode(scene),
+        getattr(scene, "gob_sp_autosplit_method", "SMART"),
+        selected_only,
+        bool(getattr(prefs, "export_low_poly", False)),
+        bool(getattr(prefs, "export_high_poly", False)),
+        getattr(prefs, "low_poly_suffixes", ""),
+        getattr(prefs, "high_poly_suffixes", ""),
+        low_collection.name if low_collection else "",
+        high_collection.name if high_collection else "",
+        bool(getattr(prefs, "export_cage_poly", False)),
+        getattr(prefs, "cage_poly_suffixes", ""),
+        cage_collection.name if cage_collection else "",
+    )
+
+
+def get_cached_export_plan(context, prefs):
+    key = _export_plan_cache_key(context, prefs)
+    cached = _export_plan_cache
+    if cached["plan"] is not None and cached["key"] == key:
+        return cached["plan"]
+    plan = build_export_plan(context, prefs)
+    cached["key"] = key
+    cached["plan"] = plan
+    return plan
+
+
+def _invalidate_export_caches():
+    _tri_count_cache.clear()
+    _obj_info_cache.clear()
+    _export_plan_cache["key"] = None
+    _export_plan_cache["plan"] = None
+
+
+def _on_export_settings_update(self, _context):
+    _invalidate_export_caches()
+    _set_export_warning("")
 
 
 def collect_high_poly_candidates(context, prefs):
@@ -2444,17 +3029,18 @@ def collect_high_poly_candidates(context, prefs):
         selected_names = {
             obj.name for obj in context.selected_objects if obj.type == "MESH"
         }
-    high_collection = getattr(scene, "gob_sp_high_poly_collection", None)
-    if not collection_in_scene(scene, high_collection):
-        high_collection = None
-    if high_collection:
-        objects = collect_collection_meshes(
-            high_collection,
-            selected_only=selected_only,
-            selected_names=selected_names,
-        )
-        if objects:
-            return objects
+    if get_identify_mode(scene) == "COLLECTIONS":
+        high_collection = getattr(scene, "gob_sp_high_poly_collection", None)
+        if not collection_in_scene(scene, high_collection):
+            high_collection = None
+        if high_collection:
+            objects = collect_collection_meshes(
+                high_collection,
+                selected_only=selected_only,
+                selected_names=selected_names,
+            )
+            if objects:
+                return objects
     suffixes = parse_suffixes(getattr(prefs, "high_poly_suffixes", ""))
     if suffixes:
         for obj in context.scene.objects:
@@ -2465,7 +3051,50 @@ def collect_high_poly_candidates(context, prefs):
     for obj in context.scene.objects:
         if obj.type == "MESH" and obj.get("gob_high_poly"):
             objects.append(obj)
-    if selected_only and selected_names:
+    if selected_only and selected_names is not None:
+        objects = [obj for obj in objects if obj.name in selected_names]
+    unique = []
+    seen = set()
+    for obj in objects:
+        if obj.name in seen:
+            continue
+        seen.add(obj.name)
+        unique.append(obj)
+    return unique
+
+
+def collect_cage_objects(context, prefs):
+    scene = context.scene
+    objects = []
+    selected_only = bool(prefs and getattr(prefs, "export_selected_only", False))
+    selected_names = None
+    if selected_only:
+        selected_names = {
+            obj.name for obj in context.selected_objects if obj.type == "MESH"
+        }
+    if get_identify_mode(scene) == "COLLECTIONS":
+        cage_collection = getattr(scene, "gob_sp_cage_collection", None)
+        if not collection_in_scene(scene, cage_collection):
+            cage_collection = None
+        if cage_collection:
+            objects = collect_collection_meshes(
+                cage_collection,
+                selected_only=selected_only,
+                selected_names=selected_names,
+            )
+            if objects:
+                return objects
+    suffixes = parse_suffixes(getattr(prefs, "cage_poly_suffixes", ""))
+    if suffixes:
+        for obj in context.scene.objects:
+            if obj.type != "MESH":
+                continue
+            if is_name_with_suffix(obj.name, suffixes):
+                objects.append(obj)
+    for obj in context.scene.objects:
+        if obj.type == "MESH" and obj.get("gob_cage_poly"):
+            objects.append(obj)
+    if selected_only and selected_names is not None:
         objects = [obj for obj in objects if obj.name in selected_names]
     unique = []
     seen = set()
@@ -2479,7 +3108,10 @@ def collect_high_poly_candidates(context, prefs):
 
 def import_fbx(filepath):
     before = {obj.name for obj in bpy.data.objects}
-    bpy.ops.import_scene.fbx(filepath=str(filepath))
+    try:
+        bpy.ops.import_scene.fbx(filepath=str(filepath))
+    except Exception:
+        return []
     return [obj for obj in bpy.data.objects if obj.name not in before]
 
 
@@ -2543,6 +3175,256 @@ def find_sp_exe(_prefs):
                 if "painter" in name and "substance" in name:
                     return str(app)
     return None
+
+
+TEMPLATE_SCAN_CACHE_TTL = 5.0
+_template_scan_cache = {"timestamp": 0.0, "entries": None}
+
+COLOR_MANAGEMENT_MANIFEST_KEYS = {
+    "PAINTER_DEFAULT": "painter_default",
+    "OCIO_SUBSTANCE": "ocio:substance",
+    "OCIO_ACES_1_0_3": "ocio:aces_1.0.3",
+    "OCIO_ACES_1_2": "ocio:aces_1.2",
+    "OCIO_ACES_2_0": "ocio:aces_2.0",
+    "OCIO_CUSTOM": "ocio_custom",
+}
+
+PROJECT_WORKFLOW_MANIFEST_KEYS = {
+    "DEFAULT": "Default",
+    "UV_TILE": "UVTile",
+    "TEXTURE_SET_PER_UV_TILE": "TextureSetPerUVTile",
+}
+
+NORMAL_MAP_FORMAT_MANIFEST_KEYS = {
+    "OPENGL": "OpenGL",
+    "DIRECTX": "DirectX",
+}
+
+
+def sp_install_resources_dir(sp_exe):
+    if not sp_exe:
+        return None
+    try:
+        path = Path(sp_exe).expanduser()
+    except Exception:
+        return None
+    if path.suffix.lower() == ".app":
+        return path / "Contents" / "Resources"
+    for parent in path.parents:
+        if parent.suffix.lower() == ".app":
+            return parent / "Contents" / "Resources"
+    return path.parent / "resources"
+
+
+def sp_user_templates_dir():
+    try:
+        docs = windows_documents_dir()
+    except Exception:
+        docs = None
+    if not docs:
+        try:
+            docs = Path.home() / "Documents"
+        except Exception:
+            return None
+    return (
+        Path(docs)
+        / "Adobe"
+        / "Adobe Substance 3D Painter"
+        / "assets"
+        / "templates"
+    )
+
+
+def _template_entries_from_dir(directory, prefix):
+    entries = []
+    try:
+        if not directory or not directory.is_dir():
+            return entries
+        for path in sorted(directory.glob("*.spt"), key=lambda item: item.name.lower()):
+            if not path.is_file():
+                continue
+            label = path.stem if prefix == "builtin" else f"{path.stem} (user)"
+            entries.append({
+                "key": f"{prefix}:{path.stem}",
+                "label": label,
+                "path": str(path),
+            })
+    except Exception:
+        return []
+    return entries
+
+
+def scan_sp_templates(prefs=None):
+    entries = []
+    try:
+        resources = sp_install_resources_dir(find_sp_exe(prefs))
+        if resources:
+            entries.extend(_template_entries_from_dir(
+                resources / "starter_assets" / "templates",
+                "builtin",
+            ))
+    except Exception:
+        pass
+    try:
+        entries.extend(_template_entries_from_dir(sp_user_templates_dir(), "user"))
+    except Exception:
+        pass
+    return entries
+
+
+def get_sp_template_entries(prefs=None, force=False):
+    now = time.time()
+    if (
+        not force
+        and _template_scan_cache["entries"] is not None
+        and now - _template_scan_cache["timestamp"] < TEMPLATE_SCAN_CACHE_TTL
+    ):
+        return _template_scan_cache["entries"]
+    entries = scan_sp_templates(prefs)
+    _template_scan_cache["timestamp"] = now
+    _template_scan_cache["entries"] = entries
+    return entries
+
+
+def _refresh_template_cache():
+    _template_scan_cache["timestamp"] = 0.0
+    _template_scan_cache["entries"] = None
+
+
+def _sp_template_picker_items(self, _context):
+    items = [(
+        "NONE",
+        "Painter default",
+        "No template, Painter's standard new project",
+        0,
+    )]
+    try:
+        for index, entry in enumerate(get_sp_template_entries(), start=1):
+            items.append((entry["key"], entry["label"], "", index))
+    except Exception:
+        pass
+    return items
+
+
+def _sp_template_picker_get(self):
+    current = getattr(self, "sp_project_template", "NONE") or "NONE"
+    for _key, _label, _desc, number in _sp_template_picker_items(self, None):
+        if _key == current:
+            return number
+    return 0
+
+
+def _sp_template_picker_set(self, value):
+    for key, _label, _desc, number in _sp_template_picker_items(self, None):
+        if number == value:
+            self.sp_project_template = key
+            return
+    self.sp_project_template = "NONE"
+
+
+def resolve_sp_template_path(template_key, prefs=None):
+    if not template_key or template_key == "NONE":
+        return ""
+    try:
+        prefix, stem = template_key.split(":", 1)
+    except ValueError:
+        return ""
+    if not stem or stem in (".", "..") or "/" in stem or "\\" in stem:
+        return ""
+    base = None
+    if prefix == "builtin":
+        try:
+            resources = sp_install_resources_dir(find_sp_exe(prefs))
+        except Exception:
+            resources = None
+        if resources:
+            base = resources / "starter_assets" / "templates"
+    elif prefix == "user":
+        base = sp_user_templates_dir()
+    if not base:
+        return ""
+    candidate = base / f"{stem}.spt"
+    try:
+        if candidate.is_file():
+            return str(candidate)
+    except OSError:
+        return ""
+    return ""
+
+
+def build_sp_project_settings(prefs):
+    warnings = []
+    if prefs is None:
+        return None, warnings
+    raw_template = getattr(prefs, "sp_project_template", "NONE")
+    template_key = raw_template or "NONE"
+    color_mode = getattr(prefs, "sp_color_management", "PAINTER_DEFAULT") or "PAINTER_DEFAULT"
+    auto_unwrap = bool(getattr(prefs, "sp_auto_unwrap", False))
+    unwrap_mode = getattr(prefs, "sp_unwrap_mode", "DEFAULT") or "DEFAULT"
+    resolution = getattr(prefs, "sp_default_resolution", "PAINTER_DEFAULT") or "PAINTER_DEFAULT"
+    workflow = getattr(prefs, "sp_project_workflow", "PAINTER_DEFAULT") or "PAINTER_DEFAULT"
+    normal_format = getattr(prefs, "sp_normal_map_format", "PAINTER_DEFAULT") or "PAINTER_DEFAULT"
+
+    template_path = ""
+    if template_key != "NONE":
+        known_keys = set()
+        try:
+            known_keys = {entry["key"] for entry in get_sp_template_entries(prefs)}
+        except Exception:
+            known_keys = set()
+        if template_key not in known_keys:
+            warnings.append("Stored template is no longer available, using Painter default")
+            template_key = "NONE"
+        else:
+            template_path = resolve_sp_template_path(template_key, prefs)
+            if not template_path:
+                warnings.append(
+                    "Template not found, using Painter default: "
+                    + template_key.split(":", 1)[-1]
+                )
+
+    has_custom_template = bool(template_key != "NONE" and template_path)
+    if (
+        not has_custom_template
+        and color_mode == "PAINTER_DEFAULT"
+        and not auto_unwrap
+        and resolution == "PAINTER_DEFAULT"
+        and workflow == "PAINTER_DEFAULT"
+        and normal_format == "PAINTER_DEFAULT"
+    ):
+        return None, warnings
+
+    color_key = COLOR_MANAGEMENT_MANIFEST_KEYS.get(color_mode, "painter_default")
+    color_config_path = ""
+    if color_mode == "OCIO_CUSTOM":
+        raw_path = (getattr(prefs, "sp_color_config_path", "") or "").strip()
+        candidate = normalize_path(bpy.path.abspath(raw_path)) if raw_path else ""
+        if candidate and Path(candidate).is_file():
+            color_config_path = candidate
+        else:
+            warnings.append(
+                "Custom .ocio config not found, using Painter default color management"
+            )
+            color_key = "painter_default"
+
+    settings = {
+        "template": template_path,
+        "color_management": color_key,
+        "color_config_path": color_config_path,
+        "auto_unwrap": auto_unwrap,
+        "unwrap_mode": "hard_surface" if unwrap_mode == "HARD_SURFACE" else "default",
+    }
+    if resolution != "PAINTER_DEFAULT":
+        settings["default_texture_resolution"] = int(resolution)
+    if workflow != "PAINTER_DEFAULT":
+        settings["project_workflow"] = PROJECT_WORKFLOW_MANIFEST_KEYS.get(
+            workflow, "Default"
+        )
+    if normal_format != "PAINTER_DEFAULT":
+        settings["normal_map_format"] = NORMAL_MAP_FORMAT_MANIFEST_KEYS.get(
+            normal_format, "OpenGL"
+        )
+    return settings, warnings
 
 
 def open_sp_project_file(project_file, sp_exe=None):
@@ -2709,11 +3591,17 @@ _update_status_kind = "idle"
 _update_status_text = "Update: not checked yet"
 _update_status_time = 0.0
 _last_export_warning = ""
-_pending_export_popup = False
 _cache_size_check_time = 0.0
 _cache_size_global = 0
 _cache_size_local = 0
 _cache_size_project_root = None
+_last_auto_clear_time = 0.0
+_sp_running_cache = {"timestamp": 0.0, "running": None}
+_sp_running_probe_thread = None
+_import_probe_cache = {"timestamp": 0.0, "key": "", "available": False}
+SP_RUNNING_CACHE_TTL = 10.0
+SP_RUNNING_SEND_MAX_AGE = 15.0
+IMPORT_PROBE_CACHE_TTL = 3.0
 
 
 def _set_update_status(kind, text, info=None):
@@ -2732,7 +3620,10 @@ def _set_update_status(kind, text, info=None):
 
 def _update_worker():
     global _update_check_result
-    _update_check_result = check_for_updates()
+    try:
+        _update_check_result = check_for_updates()
+    except Exception as exc:
+        _update_check_result = {"status": "error", "error": str(exc)}
 
 
 def _show_update_popup(info):
@@ -2779,121 +3670,114 @@ def _set_export_warning(message):
     _last_export_warning = message or ""
 
 
-def _queue_export_warning_popup(message):
-    global _pending_export_popup
-    if _pending_export_popup:
-        return
-    _pending_export_popup = True
-
-    def _show_popup():
-        global _pending_export_popup
-        _pending_export_popup = False
-        if message:
-            _show_simple_popup("GoB SP Bridge", message, icon="ERROR")
-        return None
-
-    bpy.app.timers.register(_show_popup, first_interval=0.01)
+def elide_path(text, limit=45):
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    return "…" + text[-(limit - 1):]
 
 
-def _enforce_selected_suffix_policy(context, prefs, operator=None):
-    if not (prefs and prefs.export_selected_only and prefs.export_low_poly and prefs.export_high_poly):
-        return True
-    scene = context.scene
-    if getattr(scene, "gob_sp_low_poly_collection", None) or getattr(scene, "gob_sp_high_poly_collection", None):
-        _set_export_warning("")
-        return True
-    selected_meshes = [obj for obj in context.selected_objects if obj.type == "MESH"]
-    if not selected_meshes:
-        return True
-    if prefs.experimental_auto_split_selected:
-        low_objects, high_objects = split_meshes_by_triangles(selected_meshes)
-        if low_objects and high_objects:
-            _set_export_warning("")
-            return True
-        prefs.export_high_poly = False
-        message = (
-            "Experimental auto-split needs both low and high meshes in the selection "
-            "(different triangle counts). High poly export was turned off."
+def _sp_running_probe():
+    global _sp_running_probe_thread
+    try:
+        running = bool(is_sp_running())
+    except Exception:
+        running = False
+    _sp_running_cache["running"] = running
+    _sp_running_cache["timestamp"] = time.time()
+    _sp_running_probe_thread = None
+
+
+def get_cached_sp_running():
+    global _sp_running_probe_thread
+    now = time.time()
+    if now - _sp_running_cache["timestamp"] >= SP_RUNNING_CACHE_TTL:
+        if _sp_running_probe_thread is None or not _sp_running_probe_thread.is_alive():
+            _sp_running_probe_thread = threading.Thread(
+                target=_sp_running_probe,
+                daemon=True,
+            )
+            _sp_running_probe_thread.start()
+    return _sp_running_cache["running"]
+
+
+def sp_running_for_send():
+    now = time.time()
+    cached = _sp_running_cache["running"]
+    if cached is not None and now - _sp_running_cache["timestamp"] < SP_RUNNING_SEND_MAX_AGE:
+        return cached
+    running = bool(is_sp_running())
+    _sp_running_cache["running"] = running
+    _sp_running_cache["timestamp"] = time.time()
+    return running
+
+
+def get_ui_link_status(context, prefs):
+    now = time.time()
+    cache = _ui_link_cache
+    blender_file = get_blender_file_path_or_temp(prefs)
+    if now - cache["timestamp"] < UI_LINK_CACHE_TTL and cache["blender_file"] == blender_file:
+        return cache
+    project_dir = None
+    active_info = None
+    try:
+        project_dir = get_project_dir_fast(context, prefs)
+    except Exception:
+        project_dir = None
+    try:
+        if project_dir:
+            active_info = read_active_sp_info(
+                project_meta_dir(project_dir) / ACTIVE_SP_INFO_FILENAME
+            )
+    except Exception:
+        active_info = None
+    linked_sp_project = ""
+    try:
+        linked_sp_project = resolve_linked_sp_project_file_fast(
+            project_dir,
+            active_info=active_info,
+            blender_file=blender_file,
+            prefs=prefs,
         )
-        _set_export_warning(message)
-        if operator:
-            operator.report({"WARNING"}, message)
-        _queue_export_warning_popup(message)
-        return False
-    low_suffixes = parse_suffixes(prefs.low_poly_suffixes) or ["_low"]
-    high_suffixes = parse_suffixes(prefs.high_poly_suffixes) or ["_high"]
-    has_low = False
-    has_high = False
-    has_unknown = False
-    for obj in selected_meshes:
-        is_low = is_name_with_suffix(obj.name, low_suffixes)
-        is_high = is_name_with_suffix(obj.name, high_suffixes)
-        if is_low:
-            has_low = True
-        if is_high:
-            has_high = True
-        if not (is_low or is_high):
-            has_unknown = True
-    if has_low and has_high and not has_unknown:
-        _set_export_warning("")
-        return True
-    prefs.export_high_poly = False
-    message = (
-        "Export Selected Only requires selected meshes named with low/high suffixes "
-        "(for example: _low and _high). High poly export was turned off."
-    )
-    _set_export_warning(message)
-    if operator:
-        operator.report({"WARNING"}, message)
-    _queue_export_warning_popup(message)
-    return False
+    except Exception:
+        linked_sp_project = ""
+    cache["timestamp"] = now
+    cache["blender_file"] = blender_file
+    cache["project_dir"] = str(project_dir) if project_dir else ""
+    cache["active_info"] = active_info
+    cache["linked_sp_project"] = str(linked_sp_project) if linked_sp_project else ""
+    cache["sp_running"] = get_cached_sp_running()
+    return cache
 
 
-def _on_export_selected_only_update(self, context):
-    if not self.export_selected_only:
-        if self.experimental_auto_split_selected:
-            self.experimental_auto_split_selected = False
-        _set_export_warning("")
-        return
-    _enforce_selected_suffix_policy(context, self)
+def import_available(context, prefs):
+    now = time.time()
+    blender_file = get_blender_file_path_or_temp(prefs)
+    key = normalize_path_key(blender_file)
+    if (
+        key == _import_probe_cache["key"]
+        and now - _import_probe_cache["timestamp"] < IMPORT_PROBE_CACHE_TTL
+    ):
+        return _import_probe_cache["available"]
+    available = False
+    try:
+        project_dir = get_project_dir_fast(context, prefs)
+        if project_dir:
+            manifest_path = find_project_manifest_path(project_dir)
+            if manifest_path and manifest_path.exists():
+                available = True
+        if not available and find_active_sp_project_info(prefs):
+            available = True
+    except Exception:
+        available = False
+    _import_probe_cache["key"] = key
+    _import_probe_cache["timestamp"] = now
+    _import_probe_cache["available"] = available
+    return available
 
 
-def _on_export_low_poly_update(self, context):
-    if not self.export_low_poly:
-        if self.experimental_auto_split_selected:
-            self.experimental_auto_split_selected = False
-        _set_export_warning("")
-        return
-    if self.experimental_auto_split_selected:
-        _enforce_selected_suffix_policy(context, self)
-
-
-def _on_export_high_poly_update(self, context):
-    if not self.export_high_poly:
-        if self.experimental_auto_split_selected:
-            self.experimental_auto_split_selected = False
-        _set_export_warning("")
-        return
-    _enforce_selected_suffix_policy(context, self)
-
-
-def _on_experimental_auto_split_update(self, context):
-    if not self.experimental_auto_split_selected:
-        if self.export_low_poly:
-            self.export_low_poly = False
-        if self.export_high_poly:
-            self.export_high_poly = False
-        if self.export_selected_only:
-            self.export_selected_only = False
-        _set_export_warning("")
-        return
-    if not self.export_selected_only:
-        self.export_selected_only = True
-    if not self.export_low_poly:
-        self.export_low_poly = True
-    if not self.export_high_poly:
-        self.export_high_poly = True
-    _enforce_selected_suffix_policy(context, self)
+def _on_bridge_dir_update(self, _context):
+    _project_dir_cache.clear()
 
 
 def _on_auto_clear_cache_update(self, _context):
@@ -2901,7 +3785,7 @@ def _on_auto_clear_cache_update(self, _context):
         return
     limit = getattr(self, "cache_limit_gb", DEFAULT_CACHE_LIMIT_GB)
     message = (
-        "Warning: auto-clear removes cached projects (keeps the current project) "
+        "Warning: auto clear removes cached projects (keeps the current project) "
         f"when total cache exceeds {limit:.1f} GB."
     )
     _show_simple_popup("GoB SP Bridge", message)
@@ -2954,15 +3838,16 @@ def start_update_check(show_no_update=False, show_popup=True):
     _set_update_status("checking", "Update: checking...")
     thread = threading.Thread(target=_update_worker, daemon=True)
     thread.start()
-    bpy.app.timers.register(_update_poll, first_interval=0.5)
+    bpy.app.timers.register(_update_poll, first_interval=0.5, persistent=True)
 
 
-def get_cached_cache_sizes(context, prefs, max_age=5.0):
+def get_cached_cache_sizes(context, prefs, max_age=30.0):
     global _cache_size_check_time
     global _cache_size_global
     global _cache_size_local
     global _cache_size_project_root
     now = time.time()
+    max_age = max(30.0, max_age)
     project_dir = str(get_project_dir(context, prefs))
     if (
         _cache_size_project_root != project_dir
@@ -2971,16 +3856,34 @@ def get_cached_cache_sizes(context, prefs, max_age=5.0):
         _cache_size_project_root = project_dir
         _cache_size_global = bridge_cache_size_bytes(prefs)
         _cache_size_local = project_cache_size_bytes(context, prefs)
-        if prefs and getattr(prefs, "auto_clear_cache", False):
-            limit_bytes = cache_limit_bytes(prefs)
-            if limit_bytes and _cache_size_global > limit_bytes:
-                keep_paths = [get_project_dir(context, prefs)]
-                result = clear_cache_dir_except(get_bridge_root(prefs), keep_paths=keep_paths)
-                if result == "cleared":
-                    _cache_size_global = bridge_cache_size_bytes(prefs)
-                    _cache_size_local = project_cache_size_bytes(context, prefs)
         _cache_size_check_time = now
     return _cache_size_global, _cache_size_local
+
+
+def _auto_clear_cache_tick():
+    global _last_auto_clear_time
+    try:
+        context = bpy.context
+        if context is None:
+            return
+        prefs = get_prefs(context)
+        if not prefs or not getattr(prefs, "auto_clear_cache", False):
+            return
+        now = time.time()
+        if now - _last_auto_clear_time < 30.0:
+            return
+        _last_auto_clear_time = now
+        limit_bytes = cache_limit_bytes(prefs)
+        if not limit_bytes:
+            return
+        if bridge_cache_size_bytes(prefs) <= limit_bytes:
+            return
+        keep_paths = [get_project_dir(context, prefs)]
+        result = clear_cache_dir_except(get_bridge_root(prefs), keep_paths=keep_paths)
+        if result == "cleared":
+            refresh_cache_sizes(context, prefs)
+    except Exception:
+        pass
 
 
 def refresh_cache_sizes(context, prefs):
@@ -2997,13 +3900,7 @@ def refresh_cache_sizes(context, prefs):
 
 @persistent
 def _init_scene_ui_prefs(_context=None):
-    prefs = get_prefs(bpy.context) if bpy.context else None
-    default_show = prefs.ui_show_export_settings if prefs else True
-    for scene in bpy.data.scenes:
-        if not getattr(scene, "gob_sp_ui_export_settings_initialized", False):
-            scene.gob_sp_ui_show_export_settings = default_show
-            scene.gob_sp_ui_export_settings_initialized = True
-    _update_active_blender_info()
+    _refresh_active_blender_info()
     return None
 
 
@@ -3012,17 +3909,17 @@ class GOBSPPreferences(AddonPreferences):
 
     bridge_dir: StringProperty(
         name="Bridge Folder",
+        description=(
+            "Shared cache folder for the Blender/Painter bridge "
+            "(the GOB_SP_BRIDGE_DIR environment variable overrides this)"
+        ),
         subtype="DIR_PATH",
         default=default_bridge_dir(),
+        update=_on_bridge_dir_update,
     )
     auto_launch_sp: BoolProperty(
-        name="Auto-launch Substance Painter",
+        name="Auto launch Substance Painter",
         default=True,
-    )
-    open_linked_sp_project: BoolProperty(
-        name="Open Linked SP Project",
-        description="Open the linked .spp file when sending to Substance Painter",
-        default=False,
     )
     force_new_sp_project_on_send: BoolProperty(
         name="Open New Painter Instance",
@@ -3035,37 +3932,46 @@ class GOBSPPreferences(AddonPreferences):
     export_high_poly: BoolProperty(
         name="Export High Poly",
         default=True,
-        update=_on_export_high_poly_update,
+        update=_on_export_settings_update,
     )
     export_low_poly: BoolProperty(
         name="Export Low Poly",
         default=True,
-        update=_on_export_low_poly_update,
+        update=_on_export_settings_update,
+    )
+    export_cage_poly: BoolProperty(
+        name="Export Cage",
+        description="Export a custom cage mesh for baking in Painter",
+        default=False,
+        update=_on_export_settings_update,
     )
     export_selected_only: BoolProperty(
         name="Only Selected Meshes",
         description="Limit low/high exports to the current selection",
         default=False,
-        update=_on_export_selected_only_update,
-    )
-    experimental_auto_split_selected: BoolProperty(
-        name="Auto-split by Triangle Count",
-        description="Split selected meshes into low/high using triangle counts",
-        default=False,
-        update=_on_experimental_auto_split_update,
+        update=_on_export_settings_update,
     )
     low_poly_suffixes: StringProperty(
         name="Low Poly Suffixes",
-        description="Comma-separated suffixes for low poly objects (must be at end)",
+        description="Comma separated suffixes for low poly objects (must be at end)",
         default="_low",
+        update=_on_export_settings_update,
     )
     high_poly_suffixes: StringProperty(
         name="High Poly Suffixes",
-        description="Comma-separated suffixes for high poly objects (must be at end)",
+        description="Comma separated suffixes for high poly objects (must be at end)",
         default="_high",
+        update=_on_export_settings_update,
+    )
+    cage_poly_suffixes: StringProperty(
+        name="Cage Poly Suffixes",
+        description="Comma separated suffixes for cage objects (must be at end)",
+        default="_cage",
+        update=_on_export_settings_update,
     )
     fbx_export_scale: FloatProperty(
         name="FBX Export Scale",
+        description="If triangles come out too small in Painter, raise Export Scale",
         default=1.0,
         min=0.001,
         max=1000.0,
@@ -3074,28 +3980,8 @@ class GOBSPPreferences(AddonPreferences):
         name="Apply Unit Scale",
         default=True,
     )
-    fbx_export_custom_normals: BoolProperty(
-        name="Export Custom Normals",
-        default=True,
-    )
-    ui_show_export_settings: BoolProperty(
-        name="Show Export Settings",
-        default=True,
-    )
-    ui_show_project_link: BoolProperty(
-        name="Show Project Link",
-        default=True,
-    )
-    ui_show_fbx_settings: BoolProperty(
-        name="Show FBX Export Settings",
-        default=False,
-    )
-    ui_show_cache: BoolProperty(
-        name="Show Cache",
-        default=False,
-    )
     auto_clear_cache: BoolProperty(
-        name="Auto-clear Global Cache",
+        name="Auto clear Global Cache",
         description="Remove cached projects (keeps the current one) when over the limit",
         default=False,
         update=_on_auto_clear_cache_update,
@@ -3106,37 +3992,136 @@ class GOBSPPreferences(AddonPreferences):
         min=1.0,
         max=2048.0,
     )
+    sp_project_template: StringProperty(
+        name="Template Key",
+        description="Stored project template key (use the Template dropdown to change it)",
+        default="NONE",
+    )
+    sp_project_template_picker: EnumProperty(
+        name="Template",
+        description="Painter project template used when a new Painter project is created",
+        items=_sp_template_picker_items,
+        get=_sp_template_picker_get,
+        set=_sp_template_picker_set,
+    )
+    sp_color_management: EnumProperty(
+        name="Color Management",
+        description="Color management used when a new Painter project is created",
+        items=(
+            ("PAINTER_DEFAULT", "Painter default (Legacy)", "Let Painter pick its standard Legacy color management"),
+            ("OCIO_SUBSTANCE", "OpenColorIO: Substance (sRGB/Rec709)", "Use Painter's bundled Substance OpenColorIO config"),
+            ("OCIO_ACES_1_0_3", "OpenColorIO: ACES 1.0.3", "Use Painter's bundled ACES 1.0.3 OpenColorIO config"),
+            ("OCIO_ACES_1_2", "OpenColorIO: ACES 1.2", "Use Painter's bundled ACES 1.2 OpenColorIO config"),
+            ("OCIO_ACES_2_0", "OpenColorIO: ACES 2.0", "Use Painter's bundled ACES 2.0 OpenColorIO config"),
+            ("OCIO_CUSTOM", "Custom .ocio file", "Use your own .ocio config file"),
+        ),
+        default="PAINTER_DEFAULT",
+    )
+    sp_color_config_path: StringProperty(
+        name="Custom .ocio Config",
+        description="Path to your custom .ocio config file",
+        subtype="FILE_PATH",
+        default="",
+    )
+    sp_auto_unwrap: BoolProperty(
+        name="Unwrap UVs in Painter",
+        description="Let Painter generate the UVs when a new Painter project is created",
+        default=False,
+    )
+    sp_unwrap_mode: EnumProperty(
+        name="Unwrap Mode",
+        description="Hard surface unwrap needs Painter 12.1 or newer",
+        items=(
+            ("DEFAULT", "Default", "Painter's standard auto unwrap"),
+            ("HARD_SURFACE", "Hard surface", "Hard surface unwrap (needs Painter 12.1+)"),
+        ),
+        default="DEFAULT",
+    )
+    sp_default_resolution: EnumProperty(
+        name="Default Texture Resolution",
+        description="Texture resolution used when a new Painter project is created",
+        items=(
+            ("PAINTER_DEFAULT", "Painter default", "Let Painter pick the texture resolution"),
+            ("512", "512", "512 pixels"),
+            ("1024", "1024", "1024 pixels"),
+            ("2048", "2048", "2048 pixels"),
+            ("4096", "4096", "4096 pixels"),
+            ("8192", "8192", "8192 pixels"),
+        ),
+        default="PAINTER_DEFAULT",
+    )
+    sp_project_workflow: EnumProperty(
+        name="Project Workflow",
+        description="Project workflow used when a new Painter project is created",
+        items=(
+            ("PAINTER_DEFAULT", "Painter default", "Let Painter pick the project workflow"),
+            ("DEFAULT", "Default", "One texture set per mesh material"),
+            ("UV_TILE", "UV Tiles (UDIM)", "UV tiles across texture sets"),
+            ("TEXTURE_SET_PER_UV_TILE", "Texture Set per UV Tile (legacy)", "Legacy UV tile workflow"),
+        ),
+        default="PAINTER_DEFAULT",
+    )
+    sp_normal_map_format: EnumProperty(
+        name="Normal Map Format",
+        description="Normal map format used when a new Painter project is created",
+        items=(
+            ("PAINTER_DEFAULT", "Painter default", "Let Painter pick the normal map format"),
+            ("OPENGL", "OpenGL", "OpenGL style normal maps"),
+            ("DIRECTX", "DirectX", "DirectX style normal maps"),
+        ),
+        default="PAINTER_DEFAULT",
+    )
 
     def draw(self, _context):
         layout = self.layout
-        layout.label(text="Bridge")
         layout.prop(self, "bridge_dir")
         layout.prop(self, "auto_launch_sp")
         layout.separator()
-        layout.label(text="Use the GoB SP panel for export options")
+        box = layout.box()
+        box.label(text="Cache")
+        box.prop(self, "auto_clear_cache")
+        row = box.row()
+        row.enabled = self.auto_clear_cache
+        row.prop(self, "cache_limit_gb")
+        layout.separator()
+        layout.label(text=f"Version {local_version_string()}")
+        layout.operator(GOB_OT_CheckUpdates.bl_idname, text="Check for Updates")
 
 
 class GOB_OT_SendToSP(Operator):
     bl_idname = "gob_sp.send_to_substance_painter"
     bl_label = "Send to Substance Painter"
+    bl_description = "Export the low/high poly meshes as FBX and hand them to Substance Painter"
+
+    @classmethod
+    def poll(cls, context):
+        prefs = get_prefs(context)
+        if not prefs:
+            return False
+        if getattr(prefs, "export_selected_only", False):
+            return any(obj.type == "MESH" for obj in context.selected_objects)
+        scene = context.scene
+        return bool(scene) and any(obj.type == "MESH" for obj in scene.objects)
 
     def execute(self, context):
         prefs = get_prefs(context)
         write_active_blender_info(context, prefs)
+        if _bridge_conflict_info:
+            self.report({"WARNING"}, "Another Blender instance is using this bridge")
         blender_file = get_blender_file_path_or_temp(prefs)
         force_new_project = bool(prefs and prefs.force_new_sp_project_on_send)
-        _enforce_selected_suffix_policy(context, prefs, operator=self)
-        if prefs and prefs.export_selected_only and prefs.experimental_auto_split_selected:
-            selected_meshes = [obj for obj in context.selected_objects if obj.type == "MESH"]
-            low_objects, high_candidates = split_meshes_by_triangles(selected_meshes)
+        auto_unwrap = bool(prefs and getattr(prefs, "sp_auto_unwrap", False))
+        _invalidate_export_caches()
+        plan = build_export_plan(context, prefs, deep=True)
+        low_objects = plan["low"]
+        high_candidates = plan["high"]
+        cage_objects = plan.get("cage") or []
+        if plan["warnings"]:
+            _set_export_warning(plan["warnings"][0])
+            for message in plan["warnings"]:
+                self.report({"WARNING"}, message)
         else:
-            low_objects = collect_low_poly_objects(context, prefs)
-            high_candidates = []
-            if prefs and prefs.export_high_poly:
-                high_candidates = collect_high_poly_candidates(context, prefs)
-        if prefs and prefs.export_high_poly and high_candidates and low_objects:
-            high_names = {obj.name for obj in high_candidates}
-            low_objects = [obj for obj in low_objects if obj.name not in high_names]
+            _set_export_warning("")
         if not low_objects and (not prefs or prefs.export_low_poly):
             self.report({"ERROR"}, "Select or name at least one low poly mesh")
             return {"CANCELLED"}
@@ -3146,7 +4131,11 @@ class GOB_OT_SendToSP(Operator):
             depsgraph = context.evaluated_depsgraph_get()
         except Exception:
             depsgraph = None
-        if low_objects and any(not object_has_uvs(obj, depsgraph=depsgraph) for obj in low_objects):
+        if (
+            low_objects
+            and not auto_unwrap
+            and any(not object_has_uvs(obj, depsgraph=depsgraph) for obj in low_objects)
+        ):
             self.report({"ERROR"}, "Missing UVs: unwrap in Blender before export")
             return {"CANCELLED"}
 
@@ -3174,7 +4163,7 @@ class GOB_OT_SendToSP(Operator):
             active_info = None
         if signature_project_dir:
             project_dir = signature_project_dir
-            if active_info and active_info.get("project_dir") != project_dir:
+            if active_info and not paths_match(active_info.get("project_dir"), project_dir):
                 active_info = None
         else:
             if active_info and not project_dir_signature_matches(active_info.get("project_dir"), mesh_signature):
@@ -3228,13 +4217,16 @@ class GOB_OT_SendToSP(Operator):
             if not low_objects:
                 self.report({"ERROR"}, "Low poly export enabled but no meshes found")
                 return {"CANCELLED"}
-            strip_uvs = False
-            export_fbx_objects(
+            strip_uvs = auto_unwrap
+            exported = export_fbx_objects(
                 export_path,
                 low_objects,
                 prefs=prefs,
                 strip_uvs=strip_uvs,
             )
+            if not exported or not export_path.exists():
+                self.report({"ERROR"}, "Low poly export failed or produced no FBX")
+                return {"CANCELLED"}
         elif not old_mesh:
             self.report({"ERROR"}, "Low poly export disabled and no previous low mesh found")
             return {"CANCELLED"}
@@ -3249,6 +4241,15 @@ class GOB_OT_SendToSP(Operator):
                     self.report({"WARNING"}, "High poly export failed or produced no FBX")
                     high_export_path = None
 
+        cage_export_path = None
+        if prefs and getattr(prefs, "export_cage_poly", False):
+            if cage_objects:
+                cage_export_path = project_dir / BLENDER_CAGE_FILENAME
+                exported = export_fbx_objects(cage_export_path, cage_objects, prefs=prefs)
+                if not exported or not cage_export_path.exists():
+                    self.report({"WARNING"}, "Cage export failed or produced no FBX")
+                    cage_export_path = None
+
         force_new_token = ""
         if force_new_project:
             force_new_token = uuid.uuid4().hex
@@ -3257,7 +4258,7 @@ class GOB_OT_SendToSP(Operator):
         if manifest_path:
             ensure_dir(manifest_path.parent)
         try:
-            sp_running = is_sp_running()
+            sp_running = sp_running_for_send()
         except Exception:
             sp_running = False
         manifest = {
@@ -3269,6 +4270,10 @@ class GOB_OT_SendToSP(Operator):
         }
         if mesh_signature:
             manifest["mesh_signature"] = mesh_signature
+        if prefs and not prefs.export_low_poly and old_manifest:
+            old_signature = old_manifest.get("mesh_signature")
+            if old_signature:
+                manifest["mesh_signature"] = old_signature
         if blender_file:
             manifest["blender_file"] = blender_file
         else:
@@ -3287,6 +4292,15 @@ class GOB_OT_SendToSP(Operator):
             manifest["high_mesh_fbx"] = str(high_export_path)
         if prefs and prefs.export_high_poly:
             manifest["high_mesh_exported"] = bool(high_export_path)
+        if cage_export_path:
+            manifest["cage_mesh_fbx"] = str(cage_export_path)
+        if prefs and getattr(prefs, "export_cage_poly", False):
+            manifest["cage_mesh_exported"] = bool(cage_export_path)
+        sp_project_settings, sp_project_warnings = build_sp_project_settings(prefs)
+        for message in sp_project_warnings:
+            self.report({"WARNING"}, message)
+        if sp_project_settings:
+            manifest["sp_project_settings"] = sp_project_settings
         write_manifest(manifest_path, manifest)
 
         sp_exe = find_sp_exe(prefs) if prefs else None
@@ -3354,7 +4368,15 @@ class GOB_OT_SendToSP(Operator):
 class GOB_OT_ImportFromSP(Operator):
     bl_idname = "gob_sp.import_from_substance_painter"
     bl_label = "Import from Substance Painter"
+    bl_description = "Import the mesh and textures Substance Painter exported back into Blender"
     bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        prefs = get_prefs(context)
+        if not prefs:
+            return False
+        return import_available(context, prefs)
 
     def execute(self, context):
         prefs = get_prefs(context)
@@ -3401,9 +4423,6 @@ class GOB_OT_ImportFromSP(Operator):
                     manifest = read_manifest(manifest_path)
         if not manifest or manifest.get("source") != "substance_painter":
             self.report({"ERROR"}, "No Substance Painter bridge manifest found for this project")
-            return {"CANCELLED"}
-        if not manifest:
-            self.report({"ERROR"}, "Failed to read bridge manifest")
             return {"CANCELLED"}
         project_dir = project_dir_from_manifest_path(manifest_path)
         project_keys = manifest_project_keys(manifest, manifest_path=manifest_path)
@@ -3504,6 +4523,17 @@ class GOB_OT_ImportFromSP(Operator):
 class GOB_OT_OpenExportFolder(Operator):
     bl_idname = "gob_sp.open_export_folder"
     bl_label = "Open Export Folder"
+    bl_description = "Open the bridge project folder used to exchange files with Substance Painter"
+
+    @classmethod
+    def poll(cls, context):
+        prefs = get_prefs(context)
+        if not prefs:
+            return False
+        try:
+            return bool(get_project_dir_fast(context, prefs))
+        except Exception:
+            return False
 
     def execute(self, context):
         prefs = get_prefs(context)
@@ -3522,6 +4552,7 @@ class GOB_OT_OpenExportFolder(Operator):
 class GOB_OT_ClearCacheGlobal(Operator):
     bl_idname = "gob_sp.clear_cache_global"
     bl_label = "Clear Global Cache"
+    bl_description = "Delete the whole bridge cache folder contents (keeps link/state files)"
 
     def execute(self, context):
         prefs = get_prefs(context)
@@ -3546,6 +4577,7 @@ class GOB_OT_ClearCacheGlobal(Operator):
 class GOB_OT_ClearCacheLocal(Operator):
     bl_idname = "gob_sp.clear_cache_local"
     bl_label = "Clear Project Cache"
+    bl_description = "Delete the cache folder of the current bridge project only"
 
     def execute(self, context):
         prefs = get_prefs(context)
@@ -3570,6 +4602,7 @@ class GOB_OT_ClearCacheLocal(Operator):
 class GOB_OT_OpenDiscord(Operator):
     bl_idname = "gob_sp.open_discord"
     bl_label = "Join Discord"
+    bl_description = "Open the GoB SP Bridge Discord invite in your browser"
 
     def execute(self, _context):
         bpy.ops.wm.url_open(url=DISCORD_INVITE_URL)
@@ -3579,6 +4612,7 @@ class GOB_OT_OpenDiscord(Operator):
 class GOB_OT_OpenBugReport(Operator):
     bl_idname = "gob_sp.open_bug_report"
     bl_label = "Report Bug"
+    bl_description = "Open the GoB SP Bridge issue tracker in your browser"
 
     def execute(self, _context):
         bpy.ops.wm.url_open(url=BUG_REPORT_URL)
@@ -3588,6 +4622,7 @@ class GOB_OT_OpenBugReport(Operator):
 class GOB_OT_CheckUpdates(Operator):
     bl_idname = "gob_sp.check_updates"
     bl_label = "Check for Updates"
+    bl_description = "Check whether a newer GoB SP Bridge version is available"
 
     def execute(self, _context):
         start_update_check(show_no_update=True, show_popup=True)
@@ -3597,11 +4632,97 @@ class GOB_OT_CheckUpdates(Operator):
 class GOB_OT_OpenUpdateURL(Operator):
     bl_idname = "gob_sp.open_update_url"
     bl_label = "Open Update Download"
+    bl_description = "Open the download page for the latest GoB SP Bridge version"
 
     def execute(self, _context):
         if not _last_update_info or not _last_update_info.get("download_url"):
             return {"CANCELLED"}
         bpy.ops.wm.url_open(url=_last_update_info["download_url"])
+        return {"FINISHED"}
+
+
+AUTOSPLIT_METHOD_LABELS = {
+    "SMART": "Smart",
+    "TRIANGLES": "Triangles only",
+    "NAMES": "Names only",
+}
+
+
+class GOB_OT_PreviewSplit(Operator):
+    bl_idname = "gob_sp.preview_split"
+    bl_label = "Preview Auto Split"
+    bl_description = "Preview how the selected meshes split into low and high poly"
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        if get_identify_mode(scene) != "AUTO_SPLIT":
+            return False
+        return any(obj.type == "MESH" for obj in context.selected_objects)
+
+    def invoke(self, context, _event):
+        scene = context.scene
+        self._method = getattr(scene, "gob_sp_autosplit_method", "SMART")
+        try:
+            depsgraph = context.evaluated_depsgraph_get()
+        except Exception:
+            depsgraph = None
+        low, high, warnings, reasons = classify_low_high(
+            context,
+            context.selected_objects,
+            depsgraph,
+            method=self._method,
+        )
+        self._entries = [
+            (
+                obj.name,
+                evaluated_triangle_count(obj, depsgraph),
+                "LOW",
+                reasons.get(obj.name, ""),
+            )
+            for obj in low
+        ]
+        self._entries += [
+            (
+                obj.name,
+                evaluated_triangle_count(obj, depsgraph),
+                "HIGH",
+                reasons.get(obj.name, ""),
+            )
+            for obj in high
+        ]
+        self._low_count = len(low)
+        self._warnings = list(warnings)
+        return context.window_manager.invoke_props_dialog(self, width=520)
+
+    def draw(self, _context):
+        layout = self.layout
+        method_label = AUTOSPLIT_METHOD_LABELS.get(self._method, self._method)
+        layout.label(text=f"Method: {method_label}")
+        for message in self._warnings:
+            row = layout.row()
+            row.alert = True
+            row.label(text=message, icon="ERROR")
+        row = layout.row()
+        low_col = row.column()
+        low_col.label(text=f"LOW ({self._low_count})")
+        high_col = row.column()
+        high_col.label(text=f"HIGH ({len(self._entries) - self._low_count})")
+        for name, count, side, reason in self._entries:
+            col = low_col if side == "LOW" else high_col
+            col.label(text=f"{name} · {count:,} tris · {side} · {reason}")
+
+    def execute(self, _context):
+        return {"FINISHED"}
+
+
+class GOB_OT_RefreshTemplates(Operator):
+    bl_idname = "gob_sp.refresh_templates"
+    bl_label = "Refresh Templates"
+    bl_description = "Rescan the Painter builtin and user template folders"
+
+    def execute(self, _context):
+        _refresh_template_cache()
         return {"FINISHED"}
 
 
@@ -3615,149 +4736,176 @@ class GOB_PT_Panel(Panel):
     def draw(self, context):
         layout = self.layout
         prefs = get_prefs(context)
-        scene = context.scene
-        show_export = getattr(scene, "gob_sp_ui_show_export_settings", True)
+        if prefs is None:
+            layout.label(text="Enable the addon and restart Blender", icon="INFO")
+            return
+        status = get_ui_link_status(context, prefs)
+        status_box = layout.box()
+        linked_sp_project = status.get("linked_sp_project") or ""
+        row = status_box.row()
+        if linked_sp_project:
+            row.label(text=Path(linked_sp_project).name, icon="LINKED")
+        else:
+            row.label(text="No linked Painter project", icon="UNLINKED")
+        sp_running = status.get("sp_running")
+        if sp_running is None:
+            running_text = "Painter: unknown"
+        elif sp_running:
+            running_text = "Painter: running"
+        else:
+            running_text = "Painter: not running"
+        status_box.label(text=running_text)
+        status_box.label(
+            text=elide_path(status.get("project_dir") or ""),
+            icon="FILE_FOLDER",
+        )
+        if _bridge_conflict_info:
+            conflict_row = status_box.row()
+            conflict_row.alert = True
+            conflict_row.label(
+                text="Another Blender instance is using this bridge",
+                icon="ERROR",
+            )
         row = layout.row(align=True)
+        row.scale_y = 1.4
         row.operator(GOB_OT_SendToSP.bl_idname, icon="EXPORT")
         row.operator(GOB_OT_ImportFromSP.bl_idname, icon="IMPORT")
         layout.operator(GOB_OT_OpenExportFolder.bl_idname, icon="FILE_FOLDER")
-        if prefs:
-            export_box = layout.box()
-            row = export_box.row()
-            icon = "TRIA_DOWN" if show_export else "TRIA_RIGHT"
-            row.prop(scene, "gob_sp_ui_show_export_settings", icon=icon,
-                     emboss=False, text="Send to Painter")
-            if show_export:
-                scope_box = export_box.box()
-                scope_box.label(text="Mesh Selection")
-                scope_col = scope_box.column(align=True)
-                scope_col.prop(prefs, "export_selected_only", text="Only Selected")
-                scope_col.prop(prefs, "export_low_poly", text="Export Low")
-                scope_col.prop(prefs, "export_high_poly", text="Export High")
-                scope_col.prop(
-                    prefs,
-                    "experimental_auto_split_selected",
-                    text="Auto-split Selected (experimental)",
+        scene = context.scene
+        layout.prop(scene, "gob_sp_ui_tab", expand=True)
+        tab = getattr(scene, "gob_sp_ui_tab", "SEND")
+        if tab == "SETUP":
+            self.draw_setup_tab(layout, prefs)
+        elif tab == "CACHE":
+            self.draw_cache_tab(context, layout, prefs)
+        elif tab == "ABOUT":
+            self.draw_about_tab(layout)
+        else:
+            self.draw_send_tab(context, layout, prefs)
+
+    def draw_send_tab(self, context, layout, prefs):
+        scene = context.scene
+        col = layout.column(align=True)
+        col.prop(prefs, "export_low_poly", text="Export Low")
+        col.prop(prefs, "export_high_poly", text="Export High")
+        col.prop(prefs, "export_cage_poly", text="Export Cage")
+        col.prop(prefs, "export_selected_only", text="Only Selected")
+        if not prefs.export_low_poly and not prefs.export_high_poly:
+            layout.label(
+                text="Enable Export Low or Export High to identify meshes",
+                icon="INFO",
+            )
+        layout.label(text="Identify by:")
+        layout.prop(scene, "gob_sp_identify_mode", expand=True)
+        mode = get_identify_mode(scene)
+        if mode == "COLLECTIONS":
+            col = layout.column(align=True)
+            col.prop_search(
+                scene,
+                "gob_sp_low_poly_collection",
+                bpy.data,
+                "collections",
+                text="Low Collection",
+            )
+            col.prop_search(
+                scene,
+                "gob_sp_high_poly_collection",
+                bpy.data,
+                "collections",
+                text="High Collection",
+            )
+            if getattr(prefs, "export_cage_poly", False):
+                col.prop_search(
+                    scene,
+                    "gob_sp_cage_collection",
+                    bpy.data,
+                    "collections",
+                    text="Cage Collection",
                 )
-                if prefs.export_high_poly:
-                    id_box = export_box.box()
-                    id_box.label(text="Low/High Identification")
-                    if prefs.export_selected_only and prefs.experimental_auto_split_selected:
-                        info = id_box.box()
-                        info.label(text="Auto-split uses triangle counts", icon="INFO")
-                        info.label(text="Lower triangle meshes export as low")
-                        info.label(text="Higher triangle meshes export as high")
-                    else:
-                        id_col = id_box.column(align=True)
-                        id_col.prop_search(
-                            scene,
-                            "gob_sp_low_poly_collection",
-                            bpy.data,
-                            "collections",
-                            text="Low Collection",
-                        )
-                        id_col.prop_search(
-                            scene,
-                            "gob_sp_high_poly_collection",
-                            bpy.data,
-                            "collections",
-                            text="High Collection",
-                        )
-                        and_or_row = id_col.row()
-                        and_or_row.alignment = "CENTER"
-                        and_or_row.label(text="AND/OR")
-                        id_col.prop(prefs, "low_poly_suffixes")
-                        id_col.prop(prefs, "high_poly_suffixes")
-                        info = id_box.box()
-                        info.label(text="Collections override suffix matching", icon="INFO")
-                        info.label(text="SP bake expects _low/_high when matching by name", icon="INFO")
-                elif prefs.export_low_poly:
-                    id_box = export_box.box()
-                    id_box.label(text="Low Identification")
-                    id_col = id_box.column(align=True)
-                    id_col.prop_search(
-                        scene,
-                        "gob_sp_low_poly_collection",
-                        bpy.data,
-                        "collections",
-                        text="Low Collection",
-                    )
-                    and_or_row = id_col.row()
-                    and_or_row.alignment = "CENTER"
-                    and_or_row.label(text="AND/OR")
-                    id_col.prop(prefs, "low_poly_suffixes")
-                    info = id_box.box()
-                    info.label(text="Collection overrides suffix matching", icon="INFO")
-                    info.label(text="SP bake expects _low/_high when matching by name", icon="INFO")
+        elif mode == "AUTO_SPLIT":
+            layout.prop(scene, "gob_sp_autosplit_method", expand=True)
+            layout.operator(GOB_OT_PreviewSplit.bl_idname, icon="VIEWZOOM")
+        else:
+            col = layout.column(align=True)
+            col.prop(prefs, "low_poly_suffixes")
+            col.prop(prefs, "high_poly_suffixes")
+            if getattr(prefs, "export_cage_poly", False):
+                col.prop(prefs, "cage_poly_suffixes")
+            layout.label(
+                text="Painter's baker matches meshes by _low/_high names",
+                icon="INFO",
+            )
+        plan = get_cached_export_plan(context, prefs)
+        if getattr(prefs, "export_selected_only", False):
+            summary = f"{len(plan['low'])} low · {len(plan['high'])} high selected"
+        else:
+            summary = f"{len(plan['low']) + len(plan['high'])} meshes (scene)"
+        layout.label(text=summary, icon="MESH_DATA")
+        warnings = [message for message in plan["warnings"] if message]
+        if not warnings:
+            if _last_export_warning:
+                _set_export_warning("")
+        elif _last_export_warning and _last_export_warning not in warnings:
+            warnings.append(_last_export_warning)
+        for message in warnings:
+            row = layout.row()
+            row.alert = True
+            row.label(text=message, icon="ERROR")
 
-                link_box = export_box.box()
-                row = link_box.row()
-                icon = "TRIA_DOWN" if prefs.ui_show_project_link else "TRIA_RIGHT"
-                row.prop(prefs, "ui_show_project_link", icon=icon, emboss=False, text="Project Link")
-                if prefs.ui_show_project_link:
-                    link_force = link_box.row()
-                    link_force.prop(
-                        prefs,
-                        "force_new_sp_project_on_send",
-                        text="Open new Painter instance",
-                    )
+    def draw_setup_tab(self, layout, prefs):
+        row = layout.row(align=True)
+        row.prop(prefs, "sp_project_template_picker", text="Template")
+        row.operator(GOB_OT_RefreshTemplates.bl_idname, text="", icon="FILE_REFRESH")
+        layout.prop(prefs, "sp_color_management", text="Color Management")
+        if prefs.sp_color_management == "OCIO_CUSTOM":
+            layout.prop(prefs, "sp_color_config_path", text="")
+        template_key = getattr(prefs, "sp_project_template", "NONE") or "NONE"
+        if template_key != "NONE" and prefs.sp_color_management != "PAINTER_DEFAULT":
+            layout.label(
+                text="The template may override the color management choice",
+                icon="INFO",
+            )
+        layout.prop(prefs, "sp_default_resolution", text="Default Resolution")
+        layout.prop(prefs, "sp_project_workflow", text="Project Workflow")
+        layout.prop(prefs, "sp_normal_map_format", text="Normal Map Format")
+        layout.prop(prefs, "sp_auto_unwrap")
+        if prefs.sp_auto_unwrap:
+            layout.prop(prefs, "sp_unwrap_mode", text="Unwrap Mode")
+        layout.label(text="Used when a new Painter project is created", icon="INFO")
+        layout.separator()
+        col = layout.column(align=True)
+        col.prop(prefs, "fbx_export_scale")
+        col.prop(prefs, "fbx_apply_unit_scale")
+        layout.prop(
+            prefs,
+            "force_new_sp_project_on_send",
+            text="Always create a new Painter project",
+        )
 
-            fbx_box = layout.box()
-            row = fbx_box.row()
-            icon = "TRIA_DOWN" if prefs.ui_show_fbx_settings else "TRIA_RIGHT"
-            row.prop(prefs, "ui_show_fbx_settings", icon=icon, emboss=False, text="FBX Export Settings")
-            if prefs.ui_show_fbx_settings:
-                col = fbx_box.column(align=True)
-                col.prop(prefs, "fbx_export_scale")
-                col.prop(prefs, "fbx_apply_unit_scale")
-                col.prop(prefs, "fbx_export_custom_normals")
-                fbx_box.label(text="Tip: if triangles too small, raise Export Scale")
+    def draw_cache_tab(self, context, layout, prefs):
+        global_size, local_size = get_cached_cache_sizes(context, prefs)
+        layout.label(text=f"Global cache: {format_bytes(global_size)}")
+        layout.label(text=f"Project cache: {format_bytes(local_size)}")
+        layout.prop(prefs, "auto_clear_cache")
+        row = layout.row()
+        row.enabled = prefs.auto_clear_cache
+        row.prop(prefs, "cache_limit_gb")
+        if prefs.auto_clear_cache:
+            layout.label(text="Auto clear keeps the current project", icon="INFO")
+        row = layout.row(align=True)
+        row.operator(GOB_OT_ClearCacheGlobal.bl_idname, icon="TRASH")
+        row.operator(GOB_OT_ClearCacheLocal.bl_idname, icon="TRASH")
 
-            cache_box = layout.box()
-            cache_refresh = bool(prefs.ui_show_cache or prefs.auto_clear_cache)
-            cache_max_age = 5.0 if prefs.auto_clear_cache else 30.0
-            if cache_refresh:
-                global_size, local_size = get_cached_cache_sizes(
-                    context,
-                    prefs,
-                    max_age=cache_max_age,
-                )
-            else:
-                global_size, local_size = _cache_size_global, _cache_size_local
-            warn_size = format_bytes(CACHE_WARN_BYTES)
-            limit_bytes = cache_limit_bytes(prefs) if prefs.auto_clear_cache else 0
-            cache_label = "Cache"
-            if limit_bytes and global_size >= limit_bytes:
-                cache_label = f"Cache (over {format_bytes(limit_bytes)})"
-            elif max(global_size, local_size) >= CACHE_WARN_BYTES:
-                cache_label = f"Cache (over {warn_size})"
-            row = cache_box.row()
-            icon = "TRIA_DOWN" if prefs.ui_show_cache else "TRIA_RIGHT"
-            row.prop(prefs, "ui_show_cache", icon=icon, emboss=False, text=cache_label)
-            if prefs.ui_show_cache:
-                cache_box.label(text=f"Global cache: {format_bytes(global_size)}")
-                cache_box.label(text=f"Project cache: {format_bytes(local_size)}")
-                row = cache_box.row()
-                row.prop(prefs, "auto_clear_cache")
-                row = cache_box.row()
-                row.enabled = prefs.auto_clear_cache
-                row.prop(prefs, "cache_limit_gb")
-                if prefs.auto_clear_cache:
-                    cache_box.label(text="Auto-clear keeps the current project", icon="INFO")
-                row = cache_box.row(align=True)
-                row.operator(GOB_OT_ClearCacheGlobal.bl_idname, icon="TRASH")
-                row.operator(GOB_OT_ClearCacheLocal.bl_idname, icon="TRASH")
-
-            links = layout.box()
-            links.label(text="Community")
-            update_row = links.row(align=True)
-            update_row.label(text=_update_status_text)
-            update_row.operator(GOB_OT_CheckUpdates.bl_idname, text="Check")
-            if _last_update_info and _last_update_info.get("download_url"):
-                update_row.operator(GOB_OT_OpenUpdateURL.bl_idname, text="Download")
-            link_row = links.row(align=True)
-            link_row.operator(GOB_OT_OpenDiscord.bl_idname, icon="URL")
-            link_row.operator(GOB_OT_OpenBugReport.bl_idname, icon="URL")
+    def draw_about_tab(self, layout):
+        layout.label(text=f"Version {local_version_string()}")
+        update_row = layout.row(align=True)
+        update_row.label(text=_update_status_text)
+        update_row.operator(GOB_OT_CheckUpdates.bl_idname, text="Check")
+        if _last_update_info and _last_update_info.get("download_url"):
+            update_row.operator(GOB_OT_OpenUpdateURL.bl_idname, text="Download")
+        link_row = layout.row(align=True)
+        link_row.operator(GOB_OT_OpenDiscord.bl_idname, icon="URL")
+        link_row.operator(GOB_OT_OpenBugReport.bl_idname, icon="URL")
 
 
 classes = (
@@ -3771,6 +4919,8 @@ classes = (
     GOB_OT_OpenBugReport,
     GOB_OT_CheckUpdates,
     GOB_OT_OpenUpdateURL,
+    GOB_OT_PreviewSplit,
+    GOB_OT_RefreshTemplates,
     GOB_PT_Panel,
 )
 
@@ -3778,26 +4928,59 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    bpy.types.Scene.gob_sp_ui_show_export_settings = BoolProperty(
-        name="Show Export Settings",
-        default=True,
+    bpy.types.Scene.gob_sp_ui_tab = EnumProperty(
+        name="Panel Tab",
+        description="Which section of the GoB SP panel to show",
+        items=(
+            ("SEND", "Send", "Export meshes and send them to Substance Painter"),
+            ("SETUP", "Project Setup", "Painter project creation settings"),
+            ("CACHE", "Cache", "Bridge cache settings"),
+            ("ABOUT", "About", "Version, updates and community links"),
+        ),
+        default="SEND",
     )
-    bpy.types.Scene.gob_sp_ui_export_settings_initialized = BoolProperty(
-        name="Export Settings Initialized",
-        default=False,
-        options={"HIDDEN"},
+    bpy.types.Scene.gob_sp_identify_mode = EnumProperty(
+        name="Low/High Identification",
+        description="How to tell low poly meshes apart from high poly meshes",
+        items=(
+            ("SUFFIXES", "By Name", "Match meshes by name suffixes"),
+            ("COLLECTIONS", "By Collection", "Use the low/high collections (suffix matching as fallback)"),
+            ("AUTO_SPLIT", "Auto Split (Beta)", "Split meshes automatically (beta)"),
+        ),
+        default="SUFFIXES",
+        update=_on_export_settings_update,
+    )
+    bpy.types.Scene.gob_sp_autosplit_method = EnumProperty(
+        name="Auto Split Method",
+        description="Which signals Auto Split uses to tell low and high poly meshes apart",
+        items=(
+            ("SMART", "Smart", "Use names, tags, modifiers, positions and triangle counts"),
+            ("TRIANGLES", "Triangles only", "Split by evaluated triangle counts only"),
+            ("NAMES", "Names only", "Split by _low/_high name pairs only"),
+        ),
+        default="SMART",
+        update=_on_export_settings_update,
     )
     bpy.types.Scene.gob_sp_low_poly_collection = PointerProperty(
         name="Low Poly Collection",
         description="Collection to export as low poly (overrides suffix matching)",
         type=bpy.types.Collection,
         poll=_scene_collection_poll,
+        update=_on_export_settings_update,
     )
     bpy.types.Scene.gob_sp_high_poly_collection = PointerProperty(
         name="High Poly Collection",
         description="Collection to export as high poly (overrides suffix matching)",
         type=bpy.types.Collection,
         poll=_scene_collection_poll,
+        update=_on_export_settings_update,
+    )
+    bpy.types.Scene.gob_sp_cage_collection = PointerProperty(
+        name="Cage Collection",
+        description="Collection to export as cage (overrides suffix matching)",
+        type=bpy.types.Collection,
+        poll=_scene_collection_poll,
+        update=_on_export_settings_update,
     )
     if _init_scene_ui_prefs not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_init_scene_ui_prefs)
@@ -3811,6 +4994,8 @@ def register():
 
 
 def unregister():
+    global _update_check_in_progress
+    global _update_check_result
     if _init_scene_ui_prefs in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_init_scene_ui_prefs)
     if _update_active_blender_info in bpy.app.handlers.save_post:
@@ -3819,10 +5004,18 @@ def unregister():
         bpy.app.timers.unregister(_init_scene_ui_prefs)
     if bpy.app.timers.is_registered(_active_blender_heartbeat):
         bpy.app.timers.unregister(_active_blender_heartbeat)
-    if hasattr(bpy.types.Scene, "gob_sp_ui_export_settings_initialized"):
-        del bpy.types.Scene.gob_sp_ui_export_settings_initialized
-    if hasattr(bpy.types.Scene, "gob_sp_ui_show_export_settings"):
-        del bpy.types.Scene.gob_sp_ui_show_export_settings
+    if bpy.app.timers.is_registered(_update_poll):
+        bpy.app.timers.unregister(_update_poll)
+    _update_check_in_progress = False
+    _update_check_result = None
+    if hasattr(bpy.types.Scene, "gob_sp_identify_mode"):
+        del bpy.types.Scene.gob_sp_identify_mode
+    if hasattr(bpy.types.Scene, "gob_sp_ui_tab"):
+        del bpy.types.Scene.gob_sp_ui_tab
+    if hasattr(bpy.types.Scene, "gob_sp_autosplit_method"):
+        del bpy.types.Scene.gob_sp_autosplit_method
+    if hasattr(bpy.types.Scene, "gob_sp_cage_collection"):
+        del bpy.types.Scene.gob_sp_cage_collection
     if hasattr(bpy.types.Scene, "gob_sp_high_poly_collection"):
         del bpy.types.Scene.gob_sp_high_poly_collection
     if hasattr(bpy.types.Scene, "gob_sp_low_poly_collection"):

@@ -5,8 +5,7 @@ import shutil
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
+import uuid
 from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets, QtNetwork
@@ -20,6 +19,8 @@ BRIDGE_ROOT_HINT_FILENAME = "bridge_root.json"
 BRIDGE_SHARED_HINT_DIRNAME = ".gob_sp_bridge"
 MANIFEST_FILENAME = "bridge.json"
 BLENDER_EXPORT_FILENAME = "b2sp.fbx"
+BLENDER_HIGH_FILENAME = "b2sp_hi.fbx"
+BLENDER_CAGE_FILENAME = "b2sp_cage.fbx"
 SP_EXPORT_FILENAME = "sp2b.fbx"
 LOG_FILENAME = "sp_export_log.txt"
 PROJECT_META_DIRNAME = ".gob_meta"
@@ -37,13 +38,12 @@ ACTIVE_BLENDER_INFO_MAX_AGE = 120.0
 FORCE_NEW_TOKEN_ENV = "GOB_SP_FORCE_NEW_TOKEN"
 FORCE_NEW_TOKEN_ARG_PREFIXES = ("--gob-force-new-token=", "--gob-force-new=")
 UPDATE_URL = (
-    "https://raw.githubusercontent.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/"
-    "refs/heads/main/version.json"
+    "https://files.devalt.cloud/api/app/blender-to-substance-painter-and-back-gob"
 )
 BUG_REPORT_URL = (
     "https://github.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/issues"
 )
-PLUGIN_VERSION = "0.2.3"
+PLUGIN_VERSION = "1.0.0"
 
 EXPORT_FORMATS = [
     ("png", "PNG"),
@@ -99,6 +99,9 @@ _last_sp_project_file = None
 _project_dir_cache = {}
 _force_new_token = ""
 _send_to_blender_action = None
+_sp_session_id = uuid.uuid4().hex[:12]
+_sp_conflict_info = None
+SP_CONFLICT_MAX_AGE = 45.0
 
 
 def _rgb_channels(src_type, src_name):
@@ -294,11 +297,7 @@ def load_settings():
     path = settings_path()
     if not path.exists():
         return {}
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return {}
+    data = read_json_with_retry(path)
     return data if isinstance(data, dict) else {}
 
 
@@ -306,8 +305,7 @@ def save_settings(data):
     path = settings_path()
     ensure_dir(path.parent)
     try:
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2, ensure_ascii=True)
+        write_json_atomic(path, data)
     except OSError:
         return
 
@@ -508,11 +506,7 @@ def load_project_settings(project_dir=None):
             path = legacy_path
         else:
             return {}
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return {}
+    data = read_json_with_retry(path)
     return data if isinstance(data, dict) else {}
 
 
@@ -522,8 +516,7 @@ def save_project_settings(data, project_dir=None):
         return
     ensure_dir(path.parent)
     try:
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2, ensure_ascii=True)
+        write_json_atomic(path, data)
     except OSError:
         return
 
@@ -938,7 +931,9 @@ def normalize_path(path):
 
 def normalize_path_key(path):
     normalized = normalize_path(path)
-    return normalized.lower() if os.name == "nt" else normalized
+    if os.name == "nt" or sys.platform == "darwin":
+        return normalized.lower()
+    return normalized
 
 
 def link_registry_paths():
@@ -970,11 +965,7 @@ def load_link_registry():
     for path in link_registry_paths():
         if not path or not path.exists():
             continue
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-        except (OSError, json.JSONDecodeError):
-            continue
+        data = read_json_with_retry(path)
         if isinstance(data, dict):
             return data
     return {}
@@ -987,16 +978,14 @@ def save_link_registry(data):
     primary = paths[0]
     ensure_dir(primary.parent)
     try:
-        with open(primary, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2, ensure_ascii=True)
+        write_json_atomic(primary, data)
     except OSError:
         return
     for path in paths[1:]:
         if not path.exists():
             continue
         try:
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump(data, handle, indent=2, ensure_ascii=True)
+            write_json_atomic(path, data)
         except OSError:
             continue
 
@@ -1062,6 +1051,24 @@ def find_manifest_for_sp_project(bridge_roots, sp_project_file, source=None):
                 best_time = mtime
                 best_path = candidate
     return best_path
+
+
+def find_manifests_linking_sp_project_file(bridge_roots, sp_project_file):
+    matches = []
+    if not sp_project_file:
+        return matches
+    for root in bridge_roots:
+        if not root or not root.exists():
+            continue
+        for candidate in root.rglob(MANIFEST_FILENAME):
+            manifest = read_manifest(candidate)
+            if not isinstance(manifest, dict):
+                continue
+            for key in ("link_sp_project_file", "linked_sp_project_file"):
+                if paths_match(manifest.get(key), sp_project_file):
+                    matches.append(candidate)
+                    break
+    return matches
 
 
 def find_mesh_in_roots(bridge_roots, project_name, filename):
@@ -1134,21 +1141,38 @@ def resolve_primary_sp_project_for_blender(blender_file, current_sp_project_file
 def update_manifest_sp_project_file(old_sp_project_file, new_sp_project_file):
     if not old_sp_project_file or not new_sp_project_file:
         return
+    bridge_roots = get_candidate_bridge_roots()
     manifest_path = find_manifest_for_sp_project(
-        get_candidate_bridge_roots(),
+        bridge_roots,
         old_sp_project_file,
     )
-    if not manifest_path:
-        return
-    manifest = read_manifest(manifest_path)
-    if not isinstance(manifest, dict):
-        return
-    manifest["sp_project_file"] = str(new_sp_project_file)
-    project_dir = project_dir_from_manifest_path(manifest_path)
-    target_path = project_manifest_path(project_dir)
-    if target_path:
-        ensure_dir(target_path.parent)
-        write_manifest(target_path, manifest)
+    if manifest_path:
+        manifest = read_manifest(manifest_path)
+        if isinstance(manifest, dict):
+            manifest["sp_project_file"] = str(new_sp_project_file)
+            if paths_match(manifest.get("link_sp_project_file"), old_sp_project_file):
+                manifest["link_sp_project_file"] = str(new_sp_project_file)
+            project_dir = project_dir_from_manifest_path(manifest_path)
+            target_path = project_manifest_path(project_dir)
+            if target_path:
+                ensure_dir(target_path.parent)
+                write_manifest(target_path, manifest)
+    # Force-new secondary manifests reference the primary project through
+    # link_sp_project_file instead of sp_project_file; re-point those too.
+    for linked_path in find_manifests_linking_sp_project_file(bridge_roots, old_sp_project_file):
+        if manifest_path and normalize_path_key(linked_path) == normalize_path_key(manifest_path):
+            continue
+        manifest = read_manifest(linked_path)
+        if not isinstance(manifest, dict):
+            continue
+        for key in ("link_sp_project_file", "linked_sp_project_file"):
+            if paths_match(manifest.get(key), old_sp_project_file):
+                manifest[key] = str(new_sp_project_file)
+        project_dir = project_dir_from_manifest_path(linked_path)
+        target_path = project_manifest_path(project_dir)
+        if target_path:
+            ensure_dir(target_path.parent)
+            write_manifest(target_path, manifest)
 
 
 def write_manifest_sp_project_file(manifest, project_dir, sp_project_file):
@@ -1170,7 +1194,14 @@ def sync_saved_sp_project_file():
     current_real = get_sp_project_file_path()
     current = current_real or temp_sp_project_file_path()
     if _last_sp_project_file and current_real and not paths_match(current_real, _last_sp_project_file):
-        project_dir = get_project_dir()
+        # Resolve the project dir from the previous path: manifests and the
+        # link registry still point at it, while the new path matches nothing
+        # yet and would resolve to a fresh, wrong directory.
+        base_dir = get_bridge_root() / get_project_name()
+        project_dir = resolve_project_dir_for_sp(_last_sp_project_file, base_dir)
+        # Update the manifest first so read_linked_blender_file() below finds
+        # a manifest matching the new path.
+        update_manifest_sp_project_file(_last_sp_project_file, current_real)
         linked_blender_file = read_linked_blender_file(project_dir)
         force_new = is_force_new_project_dir(project_dir)
         if linked_blender_file:
@@ -1179,8 +1210,7 @@ def sync_saved_sp_project_file():
                 blender_file=linked_blender_file,
                 update_blender_link=not force_new,
             )
-        update_manifest_sp_project_file(_last_sp_project_file, current_real)
-        set_cached_project_dir(current_real, get_project_dir())
+        set_cached_project_dir(current_real, project_dir)
     _last_sp_project_file = current
 
 
@@ -1196,7 +1226,7 @@ def find_blender_exe():
             return str(env_candidate)
 
     if os.name == "nt":
-        program_files = os.environ.get("ProgramFiles", r"C:\\Program Files")
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
         program_files_x86 = os.environ.get("ProgramFiles(x86)")
         for base in (program_files, program_files_x86):
             if not base:
@@ -1287,6 +1317,52 @@ def active_sp_info_paths(project_dir=None):
     return unique
 
 
+def _check_sp_instance_conflict(path, info):
+    """Detect a second live Painter instance writing to the same bridge.
+
+    Reads the previous active_sp.json before it is overwritten. When it
+    carries a different session id, is fresh, and points at the same project
+    directory, record the conflict once per session and log a warning.
+    Never raises; the heartbeat must keep working either way.
+    """
+    global _sp_conflict_info
+    if _sp_conflict_info is not None:
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            previous = json.load(handle)
+    except (OSError, ValueError):
+        return
+    if not isinstance(previous, dict):
+        return
+    previous_session = previous.get("session_id")
+    if not previous_session or previous_session == _sp_session_id:
+        return
+    try:
+        previous_ts = float(previous.get("timestamp") or 0.0)
+    except (TypeError, ValueError):
+        return
+    if not previous_ts or time.time() - previous_ts > SP_CONFLICT_MAX_AGE:
+        return
+    previous_dir = previous.get("project_dir")
+    current_dir = info.get("project_dir")
+    if not previous_dir or not current_dir:
+        return
+    if not paths_match(str(previous_dir), str(current_dir)):
+        return
+    _sp_conflict_info = {
+        "detected_at": time.time(),
+        "project_dir": str(current_dir),
+    }
+    try:
+        append_log(
+            Path(str(current_dir)),
+            "Warning: two Painter instances share this project; bridge state may conflict",
+        )
+    except Exception:
+        pass
+
+
 def write_active_sp_info():
     try:
         sync_saved_sp_project_file()
@@ -1295,6 +1371,8 @@ def write_active_sp_info():
     info = {
         "timestamp": time.time(),
         "project_open": False,
+        "session_id": _sp_session_id,
+        "pid": os.getpid(),
     }
     project_dir = None
     try:
@@ -1313,6 +1391,7 @@ def write_active_sp_info():
         pass
     for path in active_sp_info_paths(project_dir):
         ensure_dir(path.parent)
+        _check_sp_instance_conflict(path, info)
         try:
             with open(path, "w", encoding="utf-8") as handle:
                 json.dump(info, handle, indent=2, ensure_ascii=True)
@@ -1397,17 +1476,41 @@ def ensure_dir(path):
     Path(path).mkdir(parents=True, exist_ok=True)
 
 
+def write_json_atomic(path, data):
+    path = Path(path)
+    temp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=True)
+        os.replace(temp_path, path)
+    except OSError:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def read_json_with_retry(path):
+    for attempt in range(2):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except json.JSONDecodeError:
+            if attempt:
+                return None
+            time.sleep(0.05)
+        except OSError:
+            return None
+    return None
+
+
 def write_manifest(path, data):
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2)
+    write_json_atomic(path, data)
 
 
 def read_manifest(path):
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return None
+    return read_json_with_retry(path)
 
 
 def get_candidate_bridge_roots():
@@ -1475,47 +1578,25 @@ def is_version_newer(remote, local):
     return parse_version(remote) > parse_version(local)
 
 
-def check_for_updates():
-    try:
-        with urllib.request.urlopen(UPDATE_URL, timeout=4) as response:
-            data = json.load(response)
-    except (OSError, json.JSONDecodeError, urllib.error.URLError) as exc:
-        return {"status": "error", "error": str(exc)}
-    if not isinstance(data, dict):
-        return {"status": "error", "error": "Invalid update data"}
-    sp_info = data.get("substance_painter") or {}
-    if not isinstance(sp_info, dict):
-        return {"status": "error", "error": "Missing Substance Painter update data"}
-    remote_version = str(sp_info.get("version") or "").strip()
-    if not remote_version:
-        return {"status": "error", "error": "Missing remote version"}
-    if not is_version_newer(remote_version, PLUGIN_VERSION):
-        return {
-            "status": "none",
-            "local_version": PLUGIN_VERSION,
-            "remote_version": remote_version,
-        }
-    return {
-        "status": "update",
-        "info": {
-            "version": remote_version,
-            "download_url": sp_info.get("download_url"),
-            "notes": data.get("notes"),
-            "local_version": PLUGIN_VERSION,
-        },
-    }
-
-
 def parse_update_data(data):
     if not isinstance(data, dict):
         return {"status": "error", "error": "Invalid update data"}
-    sp_info = data.get("substance_painter") or {}
-    if not isinstance(sp_info, dict):
-        return {"status": "error", "error": "Missing Substance Painter update data"}
-    remote_version = str(sp_info.get("version") or "").strip()
-    if not remote_version:
+    remote_version = str(data.get("version") or "").strip()
+    download_url = ""
+    files = data.get("files")
+    if isinstance(files, list):
+        for entry in files:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "")
+            if name.lower().startswith("gob_sp"):
+                download_url = str(entry.get("url") or "")
+                break
+    if not download_url:
+        download_url = str(data.get("page") or "")
+    if not remote_version and not download_url:
         return {"status": "error", "error": "Missing remote version"}
-    if not is_version_newer(remote_version, PLUGIN_VERSION):
+    if not remote_version or not is_version_newer(remote_version, PLUGIN_VERSION):
         return {
             "status": "none",
             "local_version": PLUGIN_VERSION,
@@ -1525,18 +1606,25 @@ def parse_update_data(data):
         "status": "update",
         "info": {
             "version": remote_version,
-            "download_url": sp_info.get("download_url"),
+            "download_url": download_url or None,
             "notes": data.get("notes"),
             "local_version": PLUGIN_VERSION,
         },
     }
+
+
+def main_window_or_none():
+    try:
+        return sp.ui.get_main_window()
+    except Exception:
+        return None
 
 
 def show_update_dialog(info):
     if not info:
         return "cancel"
     version = info.get("version")
-    box = QtWidgets.QMessageBox()
+    box = QtWidgets.QMessageBox(main_window_or_none())
     box.setIcon(QtWidgets.QMessageBox.Information)
     box.setWindowTitle("GoB Bridge Update")
     box.setText(
@@ -1592,14 +1680,14 @@ def show_update_result(result, show_no_update=False, force_prompt=False, auto_pr
     if not show_no_update:
         return
     if status == "none":
-        box = QtWidgets.QMessageBox()
+        box = QtWidgets.QMessageBox(main_window_or_none())
         box.setIcon(QtWidgets.QMessageBox.Information)
         box.setWindowTitle("GoB Bridge Update")
         box.setText(f"You're up to date ({PLUGIN_VERSION}).")
         box.exec()
         return
     error = result.get("error") if result else "Update check failed."
-    box = QtWidgets.QMessageBox()
+    box = QtWidgets.QMessageBox(main_window_or_none())
     box.setIcon(QtWidgets.QMessageBox.Warning)
     box.setWindowTitle("GoB Bridge Update")
     box.setText(str(error))
@@ -1611,8 +1699,6 @@ _update_check_started_at = 0.0
 _update_check_id = 0
 _update_check_active_id = None
 _update_check_timeout = 8.0
-_update_check_result = None
-_update_poll_timer = None
 _update_check_show_no_update = False
 _update_check_force_prompt = False
 _update_check_auto_prompt = False
@@ -1659,45 +1745,64 @@ def remove_update_listener(callback):
 def start_update_check(show_no_update=False, force_prompt=False, auto_prompt=False):
     global _update_check_in_progress
     global _update_check_started_at
+    global _update_check_id
+    global _update_check_active_id
     global _update_check_show_no_update
     global _update_check_force_prompt
     global _update_check_auto_prompt
-    global _update_check_result
-    global _update_poll_timer
     global _update_net_manager
     global _update_reply
     global _update_timeout_timer
     if _update_check_in_progress:
         if time.time() - _update_check_started_at < _update_check_timeout:
             return
+        # Stale check: drop it. Its aborted reply's finished signal is
+        # ignored because its captured check id is no longer active.
+        _update_check_in_progress = False
+        _update_check_active_id = None
         if _update_reply is not None:
             try:
                 _update_reply.abort()
             except Exception:
                 pass
-        _update_check_in_progress = False
+            try:
+                _update_reply.deleteLater()
+            except Exception:
+                pass
+            _update_reply = None
+    _update_check_id += 1
+    check_id = _update_check_id
+    _update_check_active_id = check_id
     _update_check_in_progress = True
     _update_check_started_at = time.time()
     _update_check_show_no_update = show_no_update
     _update_check_force_prompt = force_prompt
     _update_check_auto_prompt = auto_prompt
     _set_update_status("checking", "Update: checking...")
-    _update_check_result = None
 
     if _update_net_manager is None:
         _update_net_manager = QtNetwork.QNetworkAccessManager()
-    request = QtNetwork.QNetworkRequest(QtCore.QUrl(UPDATE_URL))
+    update_url = QtCore.QUrl(UPDATE_URL)
+    update_query = QtCore.QUrlQuery()
+    update_query.addQueryItem("current", PLUGIN_VERSION)
+    update_url.setQuery(update_query)
+    request = QtNetwork.QNetworkRequest(update_url)
     request.setHeader(QtNetwork.QNetworkRequest.UserAgentHeader, f"GoBBridge/{PLUGIN_VERSION}")
-    _update_reply = _update_net_manager.get(request)
+    reply = _update_net_manager.get(request)
+    _update_reply = reply
 
     def _finish_update_result(result):
         global _update_check_in_progress
-        global _update_check_result
+        global _update_check_active_id
         global _update_reply
         global _update_timeout_timer
         global _update_check_show_no_update
         global _update_check_force_prompt
         global _update_check_auto_prompt
+        if check_id != _update_check_active_id or not _update_check_in_progress:
+            return
+        _update_check_active_id = None
+        _update_check_in_progress = False
         if _update_timeout_timer is not None:
             try:
                 _update_timeout_timer.stop()
@@ -1710,9 +1815,9 @@ def start_update_check(show_no_update=False, force_prompt=False, auto_prompt=Fal
             except Exception:
                 pass
             _update_reply = None
-        global _update_poll_timer
-        _update_check_in_progress = False
-        if result.get("status") == "update":
+        if result.get("status") == "aborted":
+            pass
+        elif result.get("status") == "update":
             info = result.get("info")
             _set_update_status("update", f"Update available: {info['version']}", info=info)
         elif result.get("status") == "none":
@@ -1720,26 +1825,30 @@ def start_update_check(show_no_update=False, force_prompt=False, auto_prompt=Fal
         else:
             error = result.get("error") if result else "Update check failed."
             _set_update_status("error", f"Update check failed: {error}")
-        show_update_result(
-            result,
-            show_no_update=_update_check_show_no_update,
-            force_prompt=_update_check_force_prompt,
-            auto_prompt=_update_check_auto_prompt,
-        )
+        if result.get("status") != "aborted":
+            show_update_result(
+                result,
+                show_no_update=_update_check_show_no_update,
+                force_prompt=_update_check_force_prompt,
+                auto_prompt=_update_check_auto_prompt,
+            )
         _update_check_show_no_update = False
         _update_check_force_prompt = False
         _update_check_auto_prompt = False
 
     def _handle_reply_finished():
-        global _update_check_result
-        if _update_reply is None:
+        if check_id != _update_check_active_id or reply is not _update_reply:
             return
-        if _update_reply.error() != QtNetwork.QNetworkReply.NoError:
-            error = _update_reply.errorString()
-            _finish_update_result({"status": "error", "error": error})
+        error = reply.error()
+        if error != QtNetwork.QNetworkReply.NoError:
+            if error == QtNetwork.QNetworkReply.OperationCanceledError:
+                # Aborted (stale check, timeout or plugin unload): never an error.
+                _finish_update_result({"status": "aborted"})
+                return
+            _finish_update_result({"status": "error", "error": reply.errorString()})
             return
         try:
-            raw = bytes(_update_reply.readAll())
+            raw = bytes(reply.readAll())
             data = json.loads(raw.decode("utf-8"))
         except Exception as exc:
             _finish_update_result({"status": "error", "error": str(exc)})
@@ -1747,7 +1856,7 @@ def start_update_check(show_no_update=False, force_prompt=False, auto_prompt=Fal
         result = parse_update_data(data)
         _finish_update_result(result)
 
-    _update_reply.finished.connect(_handle_reply_finished)
+    reply.finished.connect(_handle_reply_finished)
 
     if _update_timeout_timer is not None:
         try:
@@ -1759,13 +1868,8 @@ def start_update_check(show_no_update=False, force_prompt=False, auto_prompt=Fal
     _update_timeout_timer.setSingleShot(True)
 
     def _on_timeout():
-        if not _update_check_in_progress:
+        if check_id != _update_check_active_id or not _update_check_in_progress:
             return
-        if _update_reply is not None:
-            try:
-                _update_reply.abort()
-            except Exception:
-                pass
         _finish_update_result({"status": "error", "error": "Update check timed out"})
 
     _update_timeout_timer.timeout.connect(_on_timeout)
@@ -1773,7 +1877,7 @@ def start_update_check(show_no_update=False, force_prompt=False, auto_prompt=Fal
 
 
 def show_message(title, text, icon=QtWidgets.QMessageBox.Information):
-    box = QtWidgets.QMessageBox()
+    box = QtWidgets.QMessageBox(main_window_or_none())
     box.setIcon(icon)
     box.setWindowTitle(title)
     box.setText(text)
@@ -1781,7 +1885,7 @@ def show_message(title, text, icon=QtWidgets.QMessageBox.Information):
 
 
 def show_warning_dialog(title, summary, details=None):
-    box = QtWidgets.QMessageBox()
+    box = QtWidgets.QMessageBox(main_window_or_none())
     box.setIcon(QtWidgets.QMessageBox.Information)
     box.setWindowTitle(title)
     box.setText(summary)
@@ -1868,6 +1972,107 @@ def clear_high_poly_mesh():
 _high_poly_retry_timer = None
 _high_poly_retry_path = None
 _high_poly_retry_remaining = 0
+_project_edition_callbacks = []
+
+
+def _connect_project_edition_entered(callback):
+    _project_edition_callbacks.append(callback)
+    sp_event.DISPATCHER.connect_strong(sp_event.ProjectEditionEntered, callback)
+
+
+def _disconnect_project_edition_entered(callback):
+    try:
+        sp_event.DISPATCHER.disconnect(sp_event.ProjectEditionEntered, callback)
+    except Exception:
+        pass
+    try:
+        _project_edition_callbacks.remove(callback)
+    except ValueError:
+        pass
+
+
+_strong_event_connections = []
+
+
+def _connect_event_strong(event_cls, callback):
+    if (event_cls, callback) in _strong_event_connections:
+        return
+    _strong_event_connections.append((event_cls, callback))
+    sp_event.DISPATCHER.connect_strong(event_cls, callback)
+
+
+def _disconnect_event_strong(event_cls, callback):
+    try:
+        sp_event.DISPATCHER.disconnect(event_cls, callback)
+    except Exception:
+        pass
+    try:
+        _strong_event_connections.remove((event_cls, callback))
+    except ValueError:
+        pass
+
+
+def _disconnect_all_strong_events():
+    for event_cls, callback in list(_strong_event_connections):
+        _disconnect_event_strong(event_cls, callback)
+
+
+def _on_project_saved(_event):
+    # Save / Save As finished: propagate a renamed .spp path to the manifest,
+    # the link registry and active_sp.json immediately instead of waiting
+    # for the 5s heartbeat.
+    try:
+        sync_saved_sp_project_file()
+    except Exception:
+        pass
+    try:
+        write_active_sp_info()
+    except Exception:
+        pass
+
+
+def _on_project_opened_or_created(_event):
+    # A new project session starts here: the remembered file belongs to the
+    # previous project and must never be treated as a rename source, so
+    # reseed from scratch (write_active_sp_info re-runs the sync).
+    global _last_sp_project_file
+    try:
+        _last_sp_project_file = None
+        sync_saved_sp_project_file()
+    except Exception:
+        pass
+    try:
+        write_active_sp_info()
+    except Exception:
+        pass
+
+
+def _on_project_closed(_event):
+    # Drop the remembered file so a later ProjectOpened of an unrelated
+    # project is never mistaken for a save-as rename. Runs last because
+    # write_active_sp_info() reseeds it while the project still reports open.
+    global _last_sp_project_file
+    try:
+        write_active_sp_info()
+    except Exception:
+        pass
+    try:
+        _last_sp_project_file = None
+    except Exception:
+        pass
+
+
+def _register_project_event_hooks():
+    for event_cls, callback in (
+        (sp_event.ProjectSaved, _on_project_saved),
+        (sp_event.ProjectOpened, _on_project_opened_or_created),
+        (sp_event.ProjectCreated, _on_project_opened_or_created),
+        (sp_event.ProjectClosed, _on_project_closed),
+    ):
+        try:
+            _connect_event_strong(event_cls, callback)
+        except Exception:
+            pass
 
 
 def _stop_high_poly_retry():
@@ -1924,11 +2129,11 @@ def apply_high_poly_when_ready(high_path):
         return
 
     def _on_enter(_event):
-        sp_event.DISPATCHER.disconnect(sp_event.ProjectEditionEntered, _on_enter)
+        _disconnect_project_edition_entered(_on_enter)
         if not apply_high_poly_mesh(high_path):
             _queue_high_poly_retry(high_path)
 
-    sp_event.DISPATCHER.connect(sp_event.ProjectEditionEntered, _on_enter)
+    _connect_project_edition_entered(_on_enter)
 
 
 def clear_high_poly_when_ready():
@@ -1938,10 +2143,207 @@ def clear_high_poly_when_ready():
         return
 
     def _on_enter(_event):
-        sp_event.DISPATCHER.disconnect(sp_event.ProjectEditionEntered, _on_enter)
+        _disconnect_project_edition_entered(_on_enter)
         clear_high_poly_mesh()
 
-    sp_event.DISPATCHER.connect(sp_event.ProjectEditionEntered, _on_enter)
+    _connect_project_edition_entered(_on_enter)
+
+
+_cage_logged_events = set()
+
+
+def _cage_log_once(key, message):
+    """Honor reporting for cage events; each event is logged once per session."""
+    if key in _cage_logged_events:
+        return
+    try:
+        project_dir = get_project_dir()
+    except Exception:
+        project_dir = None
+    if not project_dir:
+        return
+    try:
+        append_log(project_dir, message)
+    except Exception:
+        return
+    _cage_logged_events.add(key)
+
+
+def apply_cage_mesh(cage_path):
+    if not cage_path or not Path(cage_path).is_file():
+        if cage_path:
+            _cage_log_once(
+                f"missing:{cage_path}",
+                f"Cage mesh file not found: {cage_path}",
+            )
+        return False
+    try:
+        import substance_painter.baking as baking
+        cage_url = high_poly_url(cage_path)
+        texsets = list(get_all_texture_sets())
+        if not texsets:
+            return False
+        applied = 0
+        cage_key_missing = False
+        for texset in texsets:
+            params = baking.BakingParameters.from_texture_set(texset)
+            common = params.common()
+            cage_prop = common.get("CageMesh")
+            if not cage_prop:
+                cage_key_missing = True
+                continue
+            baking.BakingParameters.set({cage_prop: cage_url})
+            applied += 1
+            cage_mode_prop = common.get("CageMode")
+            if cage_mode_prop:
+                mode_value = None
+                try:
+                    enum_values = cage_mode_prop.enum_values
+                    if callable(enum_values):
+                        enum_values = enum_values()
+                    for label, value in dict(enum_values).items():
+                        if "custom" in str(label).lower():
+                            mode_value = int(value)
+                            break
+                except Exception:
+                    mode_value = None
+                if mode_value is None:
+                    mode_value = 2  # Painter 12.x: CageMode "Custom file"
+                try:
+                    baking.BakingParameters.set({cage_mode_prop: mode_value})
+                except Exception:
+                    pass
+        if applied:
+            _cage_log_once(
+                f"applied:{cage_path}",
+                f"Cage mesh applied from {cage_path}",
+            )
+        elif cage_key_missing:
+            _cage_log_once(
+                "cage-key-missing",
+                "Cage mesh baking key not available in this Painter version; "
+                "cage not applied",
+            )
+        return applied > 0
+    except Exception:
+        return False
+
+
+def clear_cage_mesh():
+    try:
+        import substance_painter.baking as baking
+        texsets = list(get_all_texture_sets())
+        if not texsets:
+            return False
+        applied = 0
+        for texset in texsets:
+            params = baking.BakingParameters.from_texture_set(texset)
+            common = params.common()
+            cage_prop = common.get("CageMesh")
+            if cage_prop:
+                baking.BakingParameters.set({cage_prop: ""})
+                applied += 1
+            cage_mode_prop = common.get("CageMode")
+            if cage_mode_prop:
+                mode_value = None
+                try:
+                    enum_values = cage_mode_prop.enum_values
+                    if callable(enum_values):
+                        enum_values = enum_values()
+                    for label, value in dict(enum_values).items():
+                        if "distance" in str(label).lower():
+                            mode_value = int(value)
+                            break
+                except Exception:
+                    mode_value = None
+                if mode_value is None:
+                    mode_value = 0  # Painter 12.x: CageMode "Distance-based"
+                try:
+                    baking.BakingParameters.set({cage_mode_prop: mode_value})
+                except Exception:
+                    pass
+        return applied > 0
+    except Exception:
+        return False
+
+
+_cage_retry_timer = None
+_cage_retry_path = None
+_cage_retry_remaining = 0
+
+
+def _stop_cage_retry():
+    global _cage_retry_timer
+    global _cage_retry_path
+    global _cage_retry_remaining
+    if _cage_retry_timer is not None:
+        try:
+            _cage_retry_timer.stop()
+        except Exception:
+            pass
+    _cage_retry_path = None
+    _cage_retry_remaining = 0
+
+
+def _queue_cage_retry(cage_path, retries=HIGH_POLY_RETRY_COUNT):
+    global _cage_retry_timer
+    global _cage_retry_path
+    global _cage_retry_remaining
+    if not cage_path or retries <= 0:
+        return
+    _cage_retry_path = cage_path
+    _cage_retry_remaining = max(_cage_retry_remaining, retries)
+    if _cage_retry_timer is None:
+        _cage_retry_timer = QtCore.QTimer()
+        _cage_retry_timer.setInterval(HIGH_POLY_RETRY_DELAY_MS)
+
+        def _on_cage_retry():
+            global _cage_retry_remaining
+            if not _cage_retry_path or _cage_retry_remaining <= 0:
+                _stop_cage_retry()
+                return
+            if apply_cage_mesh(_cage_retry_path):
+                _stop_cage_retry()
+                return
+            _cage_retry_remaining -= 1
+            if _cage_retry_remaining <= 0:
+                _stop_cage_retry()
+
+        _cage_retry_timer.timeout.connect(_on_cage_retry)
+    try:
+        _cage_retry_timer.start()
+    except Exception:
+        pass
+
+
+def apply_cage_when_ready(cage_path):
+    if not cage_path:
+        return
+    _queue_cage_retry(cage_path)
+    if sp.project.is_open() and sp.project.is_in_edition_state():
+        if not apply_cage_mesh(cage_path):
+            _queue_cage_retry(cage_path)
+        return
+
+    def _on_enter(_event):
+        _disconnect_project_edition_entered(_on_enter)
+        if not apply_cage_mesh(cage_path):
+            _queue_cage_retry(cage_path)
+
+    _connect_project_edition_entered(_on_enter)
+
+
+def clear_cage_when_ready():
+    _stop_cage_retry()
+    if sp.project.is_open() and sp.project.is_in_edition_state():
+        clear_cage_mesh()
+        return
+
+    def _on_enter(_event):
+        _disconnect_project_edition_entered(_on_enter)
+        clear_cage_mesh()
+
+    _connect_project_edition_entered(_on_enter)
 
 
 def resource_id_url(resource_id):
@@ -1996,13 +2398,6 @@ def collect_export_presets():
         resource_presets = []
     for preset in resource_presets:
         add_preset(preset, "resource")
-
-    try:
-        user_presets = sp.export.list_user_export_presets()
-    except Exception:
-        user_presets = []
-    for preset in user_presets:
-        add_preset(preset, "user", "User")
 
     try:
         predefined_presets = sp.export.list_predefined_export_presets()
@@ -2162,7 +2557,7 @@ def get_output_map_definitions(preset_info, stack=None):
         return []
     if preset_info["kind"] == "custom":
         return preset_info["definition"]["maps"]
-    if preset_info["kind"] in ("resource", "user"):
+    if preset_info["kind"] == "resource":
         try:
             resource_presets = sp.export.list_resource_export_presets()
         except Exception:
@@ -2173,17 +2568,6 @@ def get_output_map_definitions(preset_info, stack=None):
                     return preset.list_output_maps()
                 except Exception:
                     return []
-        if preset_info["kind"] == "user":
-            try:
-                user_presets = sp.export.list_user_export_presets()
-            except Exception:
-                user_presets = []
-            for preset in user_presets:
-                if getattr(preset, "name", None) == preset_info["name"]:
-                    try:
-                        return preset.list_output_maps()
-                    except Exception:
-                        return []
         return []
     if preset_info["kind"] == "predefined":
         try:
@@ -2348,7 +2732,7 @@ def stack_has_doc_map(stack, doc_map_name):
         return True
     found_type = False
     for channel_name in lookup:
-        channel_type = sp.textureset.ChannelType.__members__.get(channel_name)
+        channel_type = getattr(sp.textureset.ChannelType, "__members__", {}).get(channel_name)
         if not channel_type:
             continue
         found_type = True
@@ -2413,6 +2797,30 @@ def channel_display_name(doc_map_name):
     return str(doc_map_name)
 
 
+_CHANNEL_FORMAT_SRGB = {
+    "basecolor", "diffuse", "color", "albedo",
+    "emissive", "emissioncolor",
+    "specular", "specularcolor", "specularedgecolor", "reflection",
+    "coatcolor", "fuzzcolor", "subsurfacecolor", "transmissioncolor",
+    "scattering", "scatteringcolor", "sheencolor", "absorptioncolor",
+    "translucency", "transmissive",
+}
+_CHANNEL_FORMAT_RGB_LINEAR = {"normal", "tangent", "coatnormal"}
+_CHANNEL_FORMAT_L16 = {"height", "displacement"}
+
+
+def _default_channel_format(channel_name):
+    key = normalize_map_key(channel_name)
+    ChannelFormat = sp.textureset.ChannelFormat
+    if key in _CHANNEL_FORMAT_RGB_LINEAR:
+        return ChannelFormat.RGB8
+    if key in _CHANNEL_FORMAT_L16:
+        return ChannelFormat.L16
+    if key in _CHANNEL_FORMAT_SRGB:
+        return ChannelFormat.sRGB8
+    return ChannelFormat.L8
+
+
 def ensure_stack_channel(stack, doc_map_name):
     if not stack or not doc_map_name:
         return False
@@ -2420,11 +2828,11 @@ def ensure_stack_channel(stack, doc_map_name):
         return True
     lookup = resolve_channel_names(doc_map_name)
     for channel_name in lookup:
-        channel_type = sp.textureset.ChannelType.__members__.get(channel_name)
+        channel_type = getattr(sp.textureset.ChannelType, "__members__", {}).get(channel_name)
         if not channel_type:
             continue
         try:
-            stack.add_channel(channel_type)
+            stack.add_channel(channel_type, _default_channel_format(channel_name))
         except Exception:
             continue
         try:
@@ -2530,7 +2938,7 @@ def channel_available_all_stacks(channel, stacks):
 def stack_has_channel_type(stack, channel_name):
     if not stack or not channel_name:
         return False
-    channel_type = sp.textureset.ChannelType.__members__.get(channel_name)
+    channel_type = getattr(sp.textureset.ChannelType, "__members__", {}).get(channel_name)
     if not channel_type:
         return False
     try:
@@ -2597,7 +3005,8 @@ def _auto_map_type(map_name):
     key = normalize_map_key(label)
     if not key:
         return None
-    if "occlusionroughnessmetallic" in key or "orm" in key or "arm" in key:
+    tokens = {token for token in re.split(r"[^a-z0-9]+", label.lower()) if token}
+    if "occlusionroughnessmetallic" in key or "orm" in tokens or "arm" in tokens:
         return "orm"
     if "materialparams" in key or "materialparam" in key or "maskmap" in key:
         return "orm"
@@ -2630,7 +3039,7 @@ def _auto_map_definition(map_name):
         return None
     if map_type == "orm":
         channels = _packed_doc_channels([
-            ("R", "ambientocclusion"),
+            ("R", "ambientOcclusion"),
             ("G", "roughness"),
             ("B", "metallic"),
         ])
@@ -2641,7 +3050,7 @@ def _auto_map_definition(map_name):
     elif map_type == "emission":
         channels = _rgb_channels("documentMap", "emissive")
     elif map_type == "ao":
-        channels = _gray_channels("documentMap", "ambientocclusion")
+        channels = _gray_channels("documentMap", "ambientOcclusion")
     elif map_type == "height":
         channels = _gray_channels("documentMap", "height")
     elif map_type == "glossiness":
@@ -2742,10 +3151,10 @@ def map_def_to_dict(map_def):
 
 
 def sanitize_map_definitions(preset_info, selected_texture_sets=None, stacks=None):
-    map_defs = get_output_map_definitions(preset_info)
+    stacks = stacks if stacks is not None else collect_selected_stacks(selected_texture_sets)
+    map_defs = get_output_map_definitions(preset_info, stack=stacks[0] if stacks else None)
     if not map_defs:
         return None, False, {}
-    stacks = stacks if stacks is not None else collect_selected_stacks(selected_texture_sets)
     map_names = extract_output_map_names(map_defs)
     if map_defs and not any(_map_def_has_channels(item) for item in map_defs):
         if _should_force_basecolor_for_diffuse(map_names, stacks):
@@ -2819,7 +3228,7 @@ def sanitize_map_definitions(preset_info, selected_texture_sets=None, stacks=Non
     return sanitized, changed, removed
 
 
-def infer_normal_map_format_from_preset(preset_info):
+def infer_normal_map_format_from_preset(preset_info, selected_texture_sets=None):
     if not preset_info:
         return None
     name = str(preset_info.get("name") or "").lower()
@@ -2827,7 +3236,8 @@ def infer_normal_map_format_from_preset(preset_info):
         return "directx"
     if "opengl" in name or "ogl" in name:
         return "opengl"
-    map_defs = get_output_map_definitions(preset_info)
+    stacks = collect_selected_stacks(selected_texture_sets)
+    map_defs = get_output_map_definitions(preset_info, stack=stacks[0] if stacks else None)
     for map_def in map_defs:
         if not isinstance(map_def, dict):
             continue
@@ -2995,25 +3405,6 @@ def resolve_enum_by_hints(enum_obj, hints):
     return None
 
 
-def resolve_texture_size(size_value):
-    if size_value is None:
-        return None
-    try:
-        size = int(size_value)
-    except (TypeError, ValueError):
-        return None
-    enum_cls = getattr(sp.project, "TextureSize", None)
-    if enum_cls:
-        value = resolve_enum_by_hints(enum_cls, [str(size)])
-        if value is not None:
-            return value
-        try:
-            return enum_cls(size, size)
-        except Exception:
-            pass
-    return size
-
-
 def try_set_attr(target, names, value):
     for name in names:
         if hasattr(target, name):
@@ -3023,66 +3414,6 @@ def try_set_attr(target, names, value):
             except Exception:
                 continue
     return False
-
-
-def try_set_attr_contains(target, token, value):
-    token = token.lower()
-    for name in dir(target):
-        if token not in name.lower():
-            continue
-        try:
-            setattr(target, name, value)
-            return True
-        except Exception:
-            continue
-    return False
-
-
-def set_attr_if_present(target, name, value):
-    if not hasattr(target, name):
-        return False
-    try:
-        current = getattr(target, name)
-        if callable(current):
-            return False
-    except Exception:
-        current = None
-    try:
-        setattr(target, name, value)
-        return True
-    except Exception:
-        return False
-
-
-def set_auto_unwrap_flags(target):
-    if not target:
-        return False
-    handled = False
-    candidates = [
-        "auto_unwrap",
-        "auto_unwrap_enabled",
-        "auto_unwrap_uvs",
-        "auto_unwrap_uv",
-        "unwrap",
-        "unwrap_uvs",
-        "unwrap_uv",
-        "generate_uvs",
-        "generate_uv",
-        "create_uvs",
-        "create_uv",
-        "auto_uv",
-        "auto_uvs",
-        "force_unwrap",
-        "force_auto_unwrap",
-    ]
-    for name in candidates:
-        if set_attr_if_present(target, name, True):
-            handled = True
-    if not handled:
-        try_set_attr_contains(target, "unwrap", True)
-        try_set_attr_contains(target, "uv", True)
-        handled = True
-    return handled
 
 
 def safe_project_is_open():
@@ -3184,40 +3515,47 @@ def schedule_import_when_not_busy(manifest_path=None, clear_auto_import=False):
         return False
 
 
-def build_project_settings(settings_dict):
-    if not settings_dict or not isinstance(settings_dict, dict):
-        return None
-    settings_cls = getattr(sp.project, "Settings", None) or getattr(sp.project, "ProjectSettings", None)
+HARD_SURFACE_FALLBACK_NOTE = (
+    "Hard surface unwrap isn't controllable from the API in this Painter "
+    "version; used default unwrap"
+)
+
+
+def build_project_settings(sp_project_settings):
+    """Build an sp.project.Settings from the manifest's sp_project_settings dict.
+
+    Returns (settings, notes): settings is None when nothing needs to be
+    overridden, notes is a list of user-facing strings describing what was
+    applied or defaulted (surfaced in the project creation honor report).
+    Only fields verified against the bundled Painter API are used.
+    """
+    notes = []
+    if not sp_project_settings or not isinstance(sp_project_settings, dict):
+        return None, notes
+    settings_cls = getattr(sp.project, "Settings", None)
     if not settings_cls:
-        return None
+        notes.append("Warning: project settings API unavailable; used Painter defaults")
+        return None, notes
     try:
         settings = settings_cls()
     except Exception:
-        return None
+        notes.append("Warning: could not create project settings; used Painter defaults")
+        return None, notes
 
-    document_resolution = settings_dict.get("document_resolution")
-    size_value = resolve_texture_size(document_resolution)
-    raw_size_value = None
+    applied = []
+
+    document_resolution = sp_project_settings.get("document_resolution")
+    if document_resolution is None:
+        document_resolution = sp_project_settings.get("default_texture_resolution")
     try:
-        raw_size_value = int(document_resolution)
+        resolution_value = int(document_resolution)
     except (TypeError, ValueError):
-        raw_size_value = None
-    if raw_size_value is not None:
-        try_set_attr(settings, ["default_texture_resolution"], raw_size_value)
-    if size_value is not None:
-        try_set_attr(
-            settings,
-            [
-                "texture_size",
-                "texture_set_size",
-                "default_texture_set_size",
-                "default_texture_size",
-                "texture_resolution",
-            ],
-            size_value,
-        )
+        resolution_value = None
+    if resolution_value is not None:
+        if try_set_attr(settings, ["default_texture_resolution"], resolution_value):
+            applied.append(f"resolution {resolution_value}")
 
-    normal_format = settings_dict.get("normal_map_format")
+    normal_format = sp_project_settings.get("normal_map_format")
     if normal_format:
         enum_cls = getattr(sp.project, "NormalMapFormat", None)
         normal_val = resolve_enum_member(enum_cls, str(normal_format))
@@ -3225,13 +3563,10 @@ def build_project_settings(settings_dict):
             normal_val = resolve_enum_member(enum_cls, str(normal_format).title())
         if normal_val is None:
             normal_val = normal_format
-        try_set_attr(
-            settings,
-            ["normal_map_format", "normalMapFormat", "normal_format"],
-            normal_val,
-        )
+        if try_set_attr(settings, ["normal_map_format"], normal_val):
+            applied.append(f"normal map {normal_format}")
 
-    tangent = settings_dict.get("tangent_space_per_fragment")
+    tangent = sp_project_settings.get("tangent_space_per_fragment")
     if tangent is not None:
         tangent_value = bool(tangent)
         tangent_enum = getattr(sp.project, "TangentSpace", None)
@@ -3242,153 +3577,282 @@ def build_project_settings(settings_dict):
             )
             if tangent_resolved is not None:
                 tangent_value = tangent_resolved
-        try_set_attr(
-            settings,
-            [
-                "tangent_space_mode",
-                "tangent_space_per_fragment",
-                "compute_tangent_space_per_fragment",
-            ],
-            tangent_value,
-        )
+        if try_set_attr(settings, ["tangent_space_mode"], tangent_value):
+            applied.append(
+                "tangent space per fragment" if tangent else "tangent space per vertex"
+            )
 
-    use_uv_tiles = settings_dict.get("use_uv_tiles")
-    if use_uv_tiles is not None:
-        use_uv_tiles = bool(use_uv_tiles)
-        try_set_attr(settings, ["use_uv_tiles", "use_uv_tile_workflow"], use_uv_tiles)
-        enum_cls = getattr(sp.project, "UVTileWorkflow", None) or getattr(sp.project, "UvTileWorkflow", None)
-        if enum_cls:
-            if use_uv_tiles:
-                uv_val = resolve_enum_by_hints(enum_cls, ["UDIM", "UV", "Tile"])
-            else:
-                uv_val = resolve_enum_by_hints(enum_cls, ["None", "Single", "Disabled", "Off"])
-            if uv_val is not None:
-                try_set_attr(settings, ["uv_tile_workflow", "uv_tiles_workflow"], uv_val)
-
-    import_cameras = settings_dict.get("import_cameras")
+    import_cameras = sp_project_settings.get("import_cameras")
     if import_cameras is not None:
-        try_set_attr(settings, ["import_cameras", "import_camera"], bool(import_cameras))
+        if try_set_attr(settings, ["import_cameras"], bool(import_cameras)):
+            applied.append(f"import cameras {'on' if import_cameras else 'off'}")
 
-    project_workflow = settings_dict.get("project_workflow")
+    project_workflow = sp_project_settings.get("project_workflow")
     if project_workflow:
         enum_cls = getattr(sp.project, "ProjectWorkflow", None)
-        workflow_value = resolve_enum_member(enum_cls, str(project_workflow)) if enum_cls else project_workflow
+        workflow_value = resolve_enum_member(enum_cls, str(project_workflow)) if enum_cls else None
         if workflow_value is None and enum_cls:
             workflow_value = resolve_enum_member(enum_cls, str(project_workflow).title())
         if workflow_value is None:
             workflow_value = project_workflow
-        try_set_attr(settings, ["project_workflow", "workflow"], workflow_value)
+        if try_set_attr(settings, ["project_workflow"], workflow_value):
+            applied.append(f"workflow {project_workflow}")
 
-    mesh_unit_scale = settings_dict.get("mesh_unit_scale")
+    mesh_unit_scale = sp_project_settings.get("mesh_unit_scale")
     if mesh_unit_scale is not None:
         try:
             mesh_unit_scale = float(mesh_unit_scale)
         except (TypeError, ValueError):
             mesh_unit_scale = None
         if mesh_unit_scale is not None:
-            try_set_attr(settings, ["mesh_unit_scale", "unit_scale"], mesh_unit_scale)
+            if try_set_attr(settings, ["mesh_unit_scale"], mesh_unit_scale):
+                applied.append(f"unit scale {mesh_unit_scale}")
 
-    default_save_path = settings_dict.get("default_save_path")
+    default_save_path = sp_project_settings.get("default_save_path")
     if default_save_path:
-        try_set_attr(settings, ["default_save_path", "save_path"], str(default_save_path))
+        if try_set_attr(settings, ["default_save_path"], str(default_save_path)):
+            applied.append("default save path")
 
-    export_path = settings_dict.get("export_path")
+    export_path = sp_project_settings.get("export_path")
     if export_path:
-        try_set_attr(settings, ["export_path"], str(export_path))
+        if try_set_attr(settings, ["export_path"], str(export_path)):
+            applied.append("export path")
 
-    return settings
+    if applied:
+        notes.append("Project settings: " + ", ".join(applied))
+
+    unwrap_enabled = False
+    if sp_project_settings.get("auto_unwrap"):
+        unwrap_settings = None
+        unwrap_cls = getattr(sp.project, "AutoUnwrapSettings", None)
+        if unwrap_cls is not None:
+            try:
+                unwrap_settings = unwrap_cls()
+            except Exception:
+                unwrap_settings = None
+        if unwrap_settings is None:
+            notes.append("Warning: auto unwrap unavailable in this Painter version")
+        else:
+            try:
+                settings.auto_unwrap_settings = unwrap_settings
+                unwrap_enabled = True
+            except Exception:
+                notes.append("Warning: could not enable auto unwrap")
+        if unwrap_enabled:
+            if str(sp_project_settings.get("unwrap_mode") or "default") == "hard_surface":
+                if try_apply_hard_surface_unwrap(unwrap_settings):
+                    notes.append("Auto unwrap: hard surface")
+                else:
+                    notes.append(HARD_SURFACE_FALLBACK_NOTE)
+            else:
+                notes.append("Auto unwrap: on (Painter defaults)")
+    else:
+        notes.append("Auto unwrap: off")
+
+    if not applied and not unwrap_enabled:
+        return None, notes
+    return settings, notes
 
 
-def build_import_settings(auto_unwrap=False):
-    if not auto_unwrap:
+_HARD_SURFACE_UNWRAP_ATTRS = (
+    "hard_surface",
+    "use_hard_surface",
+    "hard_surface_mode",
+    "unwrap_method",
+    "method",
+)
+
+
+def try_apply_hard_surface_unwrap(unwrap_settings):
+    """Best-effort hard surface unwrap probe; returns True when applied.
+
+    Painter 12.1.0 exposes no hard surface control on AutoUnwrapSettings, so
+    probe a set of candidate attribute names and set whatever exists. Enum
+    like attributes get the member whose name mentions hard. Never raises.
+    """
+    try:
+        for name in _HARD_SURFACE_UNWRAP_ATTRS:
+            try:
+                if not hasattr(unwrap_settings, name):
+                    continue
+                current = getattr(unwrap_settings, name, None)
+            except Exception:
+                continue
+            members = None
+            if current is not None:
+                members = getattr(type(current), "__members__", None)
+            if members:
+                hard_members = [key for key in members if "hard" in key.lower()]
+                if not hard_members:
+                    continue
+                try:
+                    setattr(unwrap_settings, name, members[hard_members[0]])
+                    return True
+                except Exception:
+                    continue
+            try:
+                setattr(unwrap_settings, name, True)
+                return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+def painter_resources_dir():
+    """Locate the Painter install's resources directory at runtime.
+
+    The substance_painter module lives at
+    <install>/resources/python/modules/substance_painter/__init__.py
+    (Contents/Resources on macOS), so walk up to the resources directory
+    instead of hardcoding an install path.
+    """
+    try:
+        module_file = Path(sp.__file__).resolve()
+    except Exception:
         return None
-    candidates = [
-        "MeshImportSettings",
-        "ImportSettings",
-        "ProjectImportSettings",
-    ]
-    settings_obj = None
-    for name in candidates:
-        cls = getattr(sp.project, name, None)
-        if cls is None:
-            continue
+    for parent in module_file.parents:
         try:
-            settings_obj = cls()
-            break
-        except Exception:
+            if parent.name.lower() == "resources" and (parent / "python").is_dir():
+                return parent
+        except OSError:
             continue
-    if not settings_obj:
+    return None
+
+
+def resolve_project_template(sp_project_settings, notes):
+    """Resolve the manifest's template path for sp.project.create."""
+    template = str(sp_project_settings.get("template") or "")
+    if not template:
+        notes.append("Template: Painter default")
         return None
-    set_auto_unwrap_flags(settings_obj)
-    try_set_attr(settings_obj, ["compute_tangent_space_per_fragment"], True)
-    return settings_obj
-
-
-def build_reload_settings(auto_unwrap=False):
     try:
-        settings = sp.project.MeshReloadingSettings(
-            import_cameras=False,
-            preserve_strokes=True,
-        )
-    except Exception:
+        template_path = Path(template)
+        if template_path.is_file():
+            notes.append(f"Template: {template_path.stem}")
+            return str(template_path)
+    except OSError:
+        pass
+    notes.append(f"Warning: template '{Path(template).name}' not found; created without template")
+    return None
+
+
+def resolve_ocio_config(sp_project_settings, notes):
+    """Resolve an OCIO config path from the manifest's color management mode.
+
+    Returns None for Painter default (Legacy) and for any mode whose config
+    file cannot be found, in which case a warning note is recorded.
+    """
+    color_mode = str(sp_project_settings.get("color_management") or "painter_default")
+    if color_mode == "painter_default":
+        notes.append("Color management: Painter default")
         return None
-    if auto_unwrap:
-        try_set_attr(settings, ["compute_tangent_space_per_fragment"], True)
-        handled = try_set_attr(
-            settings,
-            [
-                "auto_unwrap",
-                "auto_unwrap_enabled",
-                "auto_unwrap_uvs",
-                "unwrap",
-            ],
-            True,
+    if color_mode.startswith("ocio:"):
+        config_name = color_mode.split(":", 1)[1].strip()
+        config_path = None
+        resources_dir = painter_resources_dir()
+        if resources_dir and config_name:
+            config_path = resources_dir / "ocio" / config_name / "config.ocio"
+        if config_path is not None and config_path.is_file():
+            notes.append(f"Color management: OpenColorIO {config_name}")
+            return str(config_path)
+        notes.append(
+            f"Warning: bundled OCIO config '{config_name}' not found; "
+            "used Painter default color management"
         )
-        if not handled:
-            import_settings = getattr(settings, "import_settings", None) or getattr(settings, "importSettings", None)
-            if import_settings:
-                try_set_attr(import_settings, ["compute_tangent_space_per_fragment"], True)
-                handled = try_set_attr(
-                    import_settings,
-                    [
-                        "auto_unwrap",
-                        "auto_unwrap_enabled",
-                        "auto_unwrap_uvs",
-                        "unwrap",
-                    ],
-                    True,
-                )
-        if not handled:
-            try_set_attr_contains(settings, "unwrap", True)
-    return settings
+        return None
+    if color_mode == "ocio_custom":
+        custom_path = str(sp_project_settings.get("color_config_path") or "")
+        if custom_path:
+            try:
+                if Path(custom_path).is_file():
+                    notes.append("Color management: custom OpenColorIO config")
+                    return custom_path
+            except OSError:
+                pass
+        notes.append(
+            "Warning: custom OCIO config not found; used Painter default color management"
+        )
+        return None
+    notes.append(f"Warning: unknown color management '{color_mode}'; used Painter default")
+    return None
 
 
-def ensure_uv_channel():
+def create_project_with_setup(mesh_path, project_settings, template_path, ocio_config, setup_notes):
+    """Run sp.project.create with settings/template and the OCIO env override.
+
+    sp.project.create reads the OCIO environment variable at creation time,
+    so set it immediately before the call and restore the previous value in
+    a finally. Falls back to a plain create when Painter rejects the custom
+    settings or template.
+    """
+    create_attempts = [{"mesh_file_path": mesh_path}]
+    primary_kwargs = {"mesh_file_path": mesh_path}
+    if project_settings is not None:
+        primary_kwargs["settings"] = project_settings
+    if template_path:
+        primary_kwargs["template_file_path"] = template_path
+    if len(primary_kwargs) > 1:
+        create_attempts.insert(0, primary_kwargs)
+    last_exc = None
+    created = False
+    previous_ocio = os.environ.get("OCIO")
+    if ocio_config:
+        os.environ["OCIO"] = ocio_config
     try:
-        stack = sp.textureset.get_active_stack()
-    except Exception:
-        stack = None
-    if not stack:
+        for create_kwargs in create_attempts:
+            try:
+                sp.project.create(**create_kwargs)
+                created = True
+                break
+            except Exception as exc:
+                last_exc = exc
+                if is_transient_project_error(exc):
+                    raise
+                if len(create_kwargs) > 1 and isinstance(exc, (TypeError, ValueError)):
+                    continue
+                raise
+        if not created and last_exc is not None:
+            raise last_exc
+    finally:
+        if ocio_config:
+            if previous_ocio is None:
+                os.environ.pop("OCIO", None)
+            else:
+                os.environ["OCIO"] = previous_ocio
+    if created and last_exc is not None:
+        setup_notes.append(
+            "Warning: Painter rejected the custom project setup; created with default settings"
+        )
+    return created
+
+
+def report_project_setup(project_dir, notes):
+    """Non-modal honor report: bridge log file plus the Painter log window."""
+    if not notes:
+        return
+    summary = "Project setup: " + "; ".join(notes)
+    if project_dir:
+        append_log(project_dir, summary)
+    sp_logging = getattr(sp, "logging", None)
+    if sp_logging is None:
         try:
-            texsets = get_all_texture_sets()
-            if texsets:
-                stacks = get_all_stacks(texsets[0])
-                stack = stacks[0] if stacks else None
+            import substance_painter.logging as sp_logging
         except Exception:
-            stack = None
-    if not stack:
+            sp_logging = None
+    if sp_logging is None:
         return
     try:
-        uv_channel = sp.textureset.ChannelType.__members__.get("UV")
+        sp_logging.info(f"GoB Bridge: {summary}")
     except Exception:
-        uv_channel = None
-    if not uv_channel:
-        return
-    try:
-        if not stack.has_channel(uv_channel):
-            stack.add_channel(uv_channel)
-    except Exception:
-        return
+        pass
+    for note in notes:
+        if note.startswith("Warning") or "isn't controllable" in note or "not found" in note:
+            try:
+                sp_logging.warning(f"GoB Bridge: {note}")
+            except Exception:
+                pass
 
 
 class _NeutralCheckedItemDelegate(QtWidgets.QStyledItemDelegate):
@@ -3486,8 +3950,8 @@ class _DragCheckListWidget(QtWidgets.QListWidget):
 
 class ExportDialog(QtWidgets.QDialog):
     def __init__(self):
-        super().__init__(QtWidgets.QApplication.activeWindow())
-        self.setWindowTitle("GoB Bridge - Send to Blender")
+        super().__init__(main_window_or_none() or QtWidgets.QApplication.activeWindow())
+        self.setWindowTitle("GoB Bridge: Send to Blender")
         self._presets = []
         self._all_presets = []
         self._user_presets = []
@@ -3523,8 +3987,10 @@ class ExportDialog(QtWidgets.QDialog):
 
         update_bar = QtWidgets.QHBoxLayout()
         self.update_status_label = QtWidgets.QLabel()
-        self.update_status_label.setText(_update_status_text)
         self.update_status_label.setStyleSheet("font-weight: 600;")
+        self.update_status_label.setMinimumWidth(0)
+        self.update_status_label.setMaximumWidth(420)
+        self._set_update_status_label(_update_status_text)
         self.update_check_btn = QtWidgets.QPushButton("Check Updates")
         self.update_download_btn = QtWidgets.QPushButton("Download")
         self.update_download_btn.setEnabled(False)
@@ -3590,6 +4056,7 @@ class ExportDialog(QtWidgets.QDialog):
         texture_layout.addWidget(self.textures_cb)
 
         self.texture_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        self.texture_splitter.setChildrenCollapsible(False)
         texture_layout.addWidget(self.texture_splitter, 1)
 
         self.texture_sets_group = QtWidgets.QGroupBox("Texture Sets")
@@ -3613,7 +4080,7 @@ class ExportDialog(QtWidgets.QDialog):
         texset_layout.addLayout(texset_toolbar)
         self.texset_list = _DragCheckListWidget()
         self.texset_list.setObjectName("gob_texset_list")
-        self.texset_list.setMinimumWidth(280)
+        self.texset_list.setMinimumWidth(240)
         self.texset_list.setMinimumHeight(120)
         self.texset_list.setFixedHeight(120)
         self.texset_list.setSizePolicy(
@@ -3754,16 +4221,37 @@ class ExportDialog(QtWidgets.QDialog):
         self.dither_cb.setChecked(DEFAULT_EXPORT_SETTINGS["dithering"])
         params_form.addRow(self.dither_cb)
 
+        for combo in (
+            self.mesh_combo,
+            self.preset_combo,
+            self.format_combo,
+            self.bitdepth_combo,
+            self.res_combo,
+            self.padding_combo,
+        ):
+            combo.setSizeAdjustPolicy(
+                QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
+            )
+            combo.setMinimumContentsLength(10)
+            combo.setMinimumWidth(0)
+
         right_panel = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.addWidget(self.texture_params_group)
 
+        right_scroll = QtWidgets.QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        right_scroll.setWidget(right_panel)
+
+        left_panel.setMinimumWidth(280)
+        right_scroll.setMinimumWidth(400)
         self.texture_splitter.addWidget(left_panel)
-        self.texture_splitter.addWidget(right_panel)
-        self.texture_splitter.setStretchFactor(0, 3)
-        self.texture_splitter.setStretchFactor(1, 2)
-        self.texture_splitter.setSizes([380, 520])
+        self.texture_splitter.addWidget(right_scroll)
+        self.texture_splitter.setStretchFactor(0, 2)
+        self.texture_splitter.setStretchFactor(1, 3)
+        self.texture_splitter.setSizes([340, 560])
 
         content_layout.addWidget(self.texture_group)
 
@@ -3820,6 +4308,7 @@ class ExportDialog(QtWidgets.QDialog):
         self._refresh_update_status()
         self._apply_initial_size()
         self._center_on_screen()
+        QtCore.QTimer.singleShot(0, self._apply_splitter_sizes)
 
     def closeEvent(self, event):
         remove_update_listener(self._refresh_update_status)
@@ -3836,7 +4325,7 @@ class ExportDialog(QtWidgets.QDialog):
         super().closeEvent(event)
 
     def _refresh_update_status(self):
-        self.update_status_label.setText(_update_status_text)
+        self._set_update_status_label(_update_status_text)
         info = _last_update_info if _update_status_kind == "update" else None
         enabled = bool(info and info.get("download_url"))
         self.update_download_btn.setEnabled(enabled)
@@ -3845,15 +4334,28 @@ class ExportDialog(QtWidgets.QDialog):
         else:
             self.update_download_btn.setToolTip("")
 
+    def _set_update_status_label(self, text):
+        text = str(text or "")
+        metrics = self.update_status_label.fontMetrics()
+        width = self.update_status_label.maximumWidth() or 420
+        self.update_status_label.setText(
+            metrics.elidedText(text, QtCore.Qt.ElideMiddle, width)
+        )
+        self.update_status_label.setToolTip(text)
+
     def _center_on_screen(self):
-        screen = self.screen()
-        if screen is None:
-            screen = QtGui.QGuiApplication.primaryScreen()
-        if screen is None:
-            return
-        rect = screen.availableGeometry()
+        parent = self.parentWidget()
+        if parent is not None and parent.isVisible():
+            target = parent.frameGeometry()
+        else:
+            screen = self.screen()
+            if screen is None:
+                screen = QtGui.QGuiApplication.primaryScreen()
+            if screen is None:
+                return
+            target = screen.availableGeometry()
         frame = self.frameGeometry()
-        frame.moveCenter(rect.center())
+        frame.moveCenter(target.center())
         self.move(frame.topLeft())
 
     def _open_update_download(self):
@@ -3865,14 +4367,28 @@ class ExportDialog(QtWidgets.QDialog):
 
     def _apply_initial_size(self):
         screen = self.screen() or QtGui.QGuiApplication.primaryScreen()
-        width = 900
+        width = 1000
         height = 700
         if screen:
             rect = screen.availableGeometry()
             width = min(width, int(rect.width() * 0.95))
             height = min(height, int(rect.height() * 0.85))
-        self.setMinimumSize(860, 620)
+        parent = self.parentWidget()
+        if parent is not None and parent.isVisible():
+            width = min(width, max(680, int(parent.width() * 0.95)))
+            height = min(height, max(480, int(parent.height() * 0.95)))
+        self.setMinimumSize(min(880, width), min(620, height))
         self.resize(width, height)
+
+    def _apply_splitter_sizes(self):
+        try:
+            total = self.texture_splitter.width()
+            if total < 500:
+                return
+            left = min(380, int(total * 0.4))
+            self.texture_splitter.setSizes([left, total - left])
+        except Exception:
+            pass
 
     def _on_textures_toggle(self, enabled):
         active = enabled and self.preset_combo.count() > 0
@@ -4315,7 +4831,7 @@ class ExportDialog(QtWidgets.QDialog):
                 "name": preset.get("name"),
             }
         return {
-            "mesh_option": mesh_option,
+            "mesh_option": mesh_option_key(mesh_option) if mesh_option is not None else None,
             "preset": preset_ref,
             "output_maps": None,
             "export_settings": dict(DEFAULT_EXPORT_SETTINGS),
@@ -4392,35 +4908,138 @@ class ExportDialog(QtWidgets.QDialog):
         )
 
 
+def open_bridge_settings():
+    if not safe_project_is_open():
+        show_message(
+            "GoB Bridge",
+            "Open a project to change GoB Bridge settings.",
+            QtWidgets.QMessageBox.Information,
+        )
+        return
+    try:
+        dialog = ExportDialog()
+    except Exception as exc:
+        show_message("GoB Bridge", f"Could not open settings: {exc}", QtWidgets.QMessageBox.Warning)
+        return
+    dialog.exec()
+
+
 class QuickPanel(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        layout = QtWidgets.QHBoxLayout(self)
+        layout = QtWidgets.QBoxLayout(QtWidgets.QBoxLayout.LeftToRight, self)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(2)
         self.import_btn = QtWidgets.QToolButton()
         self.export_btn = QtWidgets.QToolButton()
+        self.settings_btn = QtWidgets.QToolButton()
         self.import_btn.setText("GoB Import")
         self.export_btn.setText("GoB Export")
-        for btn in (self.import_btn, self.export_btn):
+        self.settings_btn.setText("Settings")
+        for btn in (self.import_btn, self.export_btn, self.settings_btn):
             btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
             btn.setAutoRaise(True)
             btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.import_btn.setToolTip("Import from Blender")
         self.export_btn.setToolTip("Send to Blender")
+        self.settings_btn.setToolTip("Open GoB Bridge settings")
         self.import_btn.clicked.connect(import_from_blender)
         self.export_btn.clicked.connect(send_to_blender)
+        self.settings_btn.clicked.connect(open_bridge_settings)
+        self.status_label = QtWidgets.QLabel()
+        self.status_label.setStyleSheet("color: #9a9a9a; padding-left: 4px;")
+        self.status_label.setMinimumWidth(0)
+        self.status_label.setMaximumWidth(220)
         layout.addWidget(self.import_btn)
         layout.addWidget(self.export_btn)
+        layout.addWidget(self.settings_btn)
+        layout.addWidget(self.status_label)
+        self._status_timer = QtCore.QTimer(self)
+        self._status_timer.setInterval(5000)
+        self._status_timer.timeout.connect(self.refresh_link_status)
+        self._status_timer.start()
+        self.refresh_link_status()
 
+    def refresh_link_status(self):
+        self._sync_layout()
+        name = ""
+        try:
+            if safe_project_is_open():
+                linked_file = read_linked_blender_file(get_project_dir()) or ""
+                name = Path(linked_file).stem
+        except Exception:
+            name = ""
+        if _sp_conflict_info is not None:
+            self._set_status_text(
+                "Two Painter instances share this project",
+                "Another Painter instance is writing to this project bridge; "
+                "imports and exports may conflict",
+            )
+        elif name:
+            self._set_status_text(name, f"Linked Blender project: {name}")
+        else:
+            self._set_status_text("No Blender link", "No linked Blender project")
 
-def _resolve_export_shelf():
-    shelf_enum = getattr(sp.ui, "Shelf", None)
-    if shelf_enum:
-        for name in ("Export", "export", "EXPORT"):
-            if hasattr(shelf_enum, name):
-                return getattr(shelf_enum, name)
-    return None
+    def _set_status_text(self, text, tooltip=None):
+        self.status_label.setText(self._elide_status_text(text))
+        if tooltip and tooltip != text:
+            tooltip = f"{text}\n{tooltip}"
+        self.status_label.setToolTip(tooltip if tooltip is not None else text)
+
+    def _elide_status_text(self, text):
+        try:
+            width = self.status_label.maximumWidth()
+            if not width or width <= 0:
+                width = 220
+            return self.status_label.fontMetrics().elidedText(
+                text, QtCore.Qt.ElideMiddle, width
+            )
+        except Exception:
+            return text
+
+    def _sync_layout(self):
+        box = self.layout()
+        if box is None:
+            return
+        width = self.width()
+        if not width:
+            return
+        vertical = width < 340
+        want = (
+            QtWidgets.QBoxLayout.TopToBottom
+            if vertical
+            else QtWidgets.QBoxLayout.LeftToRight
+        )
+        if box.direction() != want:
+            box.setDirection(want)
+        for btn in (self.import_btn, self.export_btn, self.settings_btn):
+            btn.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding
+                if vertical
+                else QtWidgets.QSizePolicy.Preferred,
+                QtWidgets.QSizePolicy.Preferred,
+            )
+            btn.setMinimumWidth(max(0, width - 14) if vertical else 0)
+        if vertical:
+            self.status_label.setMaximumWidth(max(60, width - 12))
+            self.status_label.setVisible(True)
+            self.setSizePolicy(
+                QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Maximum
+            )
+        else:
+            self.status_label.setMaximumWidth(220)
+            self.status_label.setVisible(width >= 460)
+            self.setSizePolicy(
+                QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Preferred
+            )
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._sync_layout()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._sync_layout()
 
 
 def _add_quick_panel_ui():
@@ -4428,20 +5047,17 @@ def _add_quick_panel_ui():
     if _quick_panel_widget is not None:
         return None
     _quick_panel_widget = QuickPanel()
-    if hasattr(sp.ui, "add_shelf_widget"):
-        shelf = _resolve_export_shelf()
-        if shelf is not None:
-            try:
-                return sp.ui.add_shelf_widget(shelf, _quick_panel_widget)
-            except Exception:
-                pass
+    add_toolbar_widget = getattr(sp.ui, "add_plugins_toolbar_widget", None)
+    if callable(add_toolbar_widget):
         try:
-            return sp.ui.add_shelf_widget("Export", _quick_panel_widget)
+            add_toolbar_widget(_quick_panel_widget)
+            return _quick_panel_widget
         except Exception:
             pass
-    if hasattr(sp.ui, "add_dock_widget"):
+    add_dock_widget = getattr(sp.ui, "add_dock_widget", None)
+    if callable(add_dock_widget):
         try:
-            return sp.ui.add_dock_widget("GoB Bridge", _quick_panel_widget)
+            return add_dock_widget(_quick_panel_widget)
         except Exception:
             pass
     return None
@@ -4534,6 +5150,39 @@ def should_accept_force_new_manifest(manifest):
     return not safe_project_is_open()
 
 
+def save_project_before_force_new_close():
+    """Save the open project before closing it, asking if it was never saved.
+
+    Returns False when the project must stay open (save failed or was refused
+    while changes would be lost).
+    """
+    try:
+        if not sp.project.needs_saving():
+            return True
+    except Exception:
+        return True
+    if get_sp_project_file_path():
+        try:
+            sp.project.save()
+        except Exception:
+            return False
+        return True
+    response = QtWidgets.QMessageBox.question(
+        main_window_or_none(),
+        "GoB Bridge",
+        "The current project has unsaved changes.\nSave it before importing from Blender?",
+        QtWidgets.QMessageBox.Save | QtWidgets.QMessageBox.Discard,
+        QtWidgets.QMessageBox.Save,
+    )
+    if response != QtWidgets.QMessageBox.Save:
+        return True
+    try:
+        sp.project.save()
+    except Exception:
+        return False
+    return True
+
+
 def import_from_blender(manifest_path=None, clear_auto_import=False):
     global _auto_import_in_progress
     bridge_roots = get_candidate_bridge_roots()
@@ -4580,6 +5229,14 @@ def import_from_blender(manifest_path=None, clear_auto_import=False):
     mesh_path = manifest.get("mesh_fbx")
     high_path = manifest.get("high_mesh_fbx")
     high_exported = manifest.get("high_mesh_exported")
+    cage_path = manifest.get("cage_mesh_fbx")
+    cage_exported = manifest.get("cage_mesh_exported")
+    had_cage_path = bool(cage_path)
+    if cage_path:
+        cage_path = Path(cage_path)
+        if not cage_path.is_absolute() and project_dir:
+            cage_path = project_dir / cage_path
+        cage_path = str(cage_path)
     had_high_path = bool(high_path)
     if high_path:
         high_path = Path(high_path)
@@ -4600,6 +5257,26 @@ def import_from_blender(manifest_path=None, clear_auto_import=False):
                     clear_high_poly_when_ready()
     if not high_path and high_exported is False:
         clear_high_poly_when_ready()
+    if cage_path and not Path(cage_path).is_file():
+        fallback = project_dir / BLENDER_CAGE_FILENAME if project_dir else None
+        if fallback and fallback.exists():
+            cage_path = str(fallback)
+        else:
+            alt = find_mesh_in_roots(bridge_roots, project_name, BLENDER_CAGE_FILENAME)
+            if alt:
+                cage_path = alt
+            else:
+                cage_path = None
+                if had_cage_path:
+                    clear_cage_when_ready()
+                    if project_dir:
+                        append_log(
+                            project_dir,
+                            "Cage mesh listed in manifest but the file is missing; "
+                            "cleared cage reference",
+                        )
+    if not cage_path and cage_exported is False:
+        clear_cage_when_ready()
     force_new_project = bool(manifest.get("force_new_project"))
     if mesh_path:
         mesh_path = Path(mesh_path)
@@ -4652,6 +5329,8 @@ def import_from_blender(manifest_path=None, clear_auto_import=False):
             if success:
                 if high_path:
                     apply_high_poly_when_ready(high_path)
+                if cage_path:
+                    apply_cage_when_ready(cage_path)
                 if clear_auto_import:
                     clear_auto_import_flag(manifest_path, manifest)
                 sp_project_file = (
@@ -4729,37 +5408,48 @@ def import_from_blender(manifest_path=None, clear_auto_import=False):
                 )
             return "failure"
         if safe_project_is_open():
+            if not save_project_before_force_new_close():
+                if not clear_auto_import:
+                    show_message(
+                        "GoB Bridge",
+                        "Import cancelled: the current project has unsaved changes.",
+                        QtWidgets.QMessageBox.Warning,
+                    )
+                return "failure"
             try:
                 sp.project.close()
             except Exception:
                 pass
-    project_settings = build_project_settings(manifest.get("sp_project_settings"))
+    sp_project_settings = manifest.get("sp_project_settings")
+    if isinstance(sp_project_settings, dict) and sp_project_settings:
+        project_settings, setup_notes = build_project_settings(sp_project_settings)
+        template_path = resolve_project_template(sp_project_settings, setup_notes)
+        ocio_config = resolve_ocio_config(sp_project_settings, setup_notes)
+        if template_path and ocio_config:
+            override_note = "The template may override the color management choice"
+            if override_note not in setup_notes:
+                setup_notes.append(override_note)
+    else:
+        project_settings = None
+        template_path = None
+        ocio_config = None
+        setup_notes = ["Painter defaults (template, color management, auto unwrap)"]
     try:
         _auto_import_in_progress = True
-        create_attempts = [{"mesh_file_path": mesh_path}]
-        if project_settings:
-            create_attempts.insert(0, {"mesh_file_path": mesh_path, "settings": project_settings})
-        last_exc = None
-        created = False
-        for create_kwargs in create_attempts:
-            try:
-                sp.project.create(**create_kwargs)
-                created = True
-                break
-            except Exception as exc:
-                last_exc = exc
-                if is_transient_project_error(exc):
-                    raise
-                if "settings" in create_kwargs and isinstance(exc, (TypeError, ValueError)):
-                    continue
-                raise
-        if not created and last_exc is not None:
-            raise last_exc
+        create_project_with_setup(
+            mesh_path,
+            project_settings,
+            template_path,
+            ocio_config,
+            setup_notes,
+        )
         if force_new_project and force_new_token_matches(manifest):
             global _force_new_token
             _force_new_token = ""
         if high_path:
             apply_high_poly_when_ready(high_path)
+        if cage_path:
+            apply_cage_when_ready(cage_path)
         if clear_auto_import:
             clear_auto_import_flag(manifest_path, manifest)
         sp_project_file = (
@@ -4786,6 +5476,7 @@ def import_from_blender(manifest_path=None, clear_auto_import=False):
         if sp_project_file:
             write_manifest_sp_project_file(manifest, project_dir, sp_project_file)
         write_active_sp_info()
+        report_project_setup(project_dir, setup_notes)
         _auto_import_in_progress = False
         return "success"
     except Exception as exc:
@@ -4838,12 +5529,27 @@ def send_to_blender():
             sp_project_file,
         )
 
-    manifest = {
+    # Read-modify-write: keep keys owned by the Blender side of the bridge
+    # (mesh_signature, high_mesh_fbx, auto_import_at, ...), reset ours.
+    manifest = dict(existing_manifest) if isinstance(existing_manifest, dict) else {}
+    for key in (
+        "mesh_fbx",
+        "mesh_exported",
+        "textures",
+        "textures_dir",
+        "normal_map_format",
+        "basecolor_has_opacity",
+        "blender_file",
+        "sp_project_file",
+        "link_sp_project_file",
+    ):
+        manifest.pop(key, None)
+    manifest.update({
         "version": 1,
         "source": "substance_painter",
         "project": get_project_name(),
         "timestamp": time.time(),
-    }
+    })
     if linked_blender_file:
         manifest["blender_file"] = linked_blender_file
     if sp_project_file:
@@ -4872,20 +5578,31 @@ def send_to_blender():
 
     if options["export_mesh"]:
         mesh_path = project_dir / SP_EXPORT_FILENAME
-        result = sp.export.export_mesh(str(mesh_path), options["mesh_option"])
-        if result.status != sp.export.ExportStatus.Success:
-            show_message("GoB Bridge", result.message, QtWidgets.QMessageBox.Warning)
+        try:
+            result = sp.export.export_mesh(str(mesh_path), options["mesh_option"])
+        except Exception as exc:
+            append_log(project_dir, f"Mesh export failed: {exc}")
+            show_message("GoB Bridge", f"Mesh export failed: {exc}", QtWidgets.QMessageBox.Warning)
         else:
-            manifest["mesh_fbx"] = str(mesh_path)
-            mesh_exported = True
-            exported_any = True
+            if result.status in (sp.export.ExportStatus.Success, sp.export.ExportStatus.Warning):
+                manifest["mesh_fbx"] = str(mesh_path)
+                mesh_exported = True
+                exported_any = True
+                if result.status == sp.export.ExportStatus.Warning:
+                    append_log(project_dir, f"Mesh export warning: {result.message}")
+                    texture_warnings.append(f"Mesh export warning: {result.message}")
+            else:
+                show_message("GoB Bridge", result.message, QtWidgets.QMessageBox.Warning)
 
     if options["export_textures"]:
         preset = options.get("preset") or pick_export_preset()
         if not preset:
             texture_errors.append("No export preset found.")
         else:
-            normal_format = infer_normal_map_format_from_preset(preset)
+            normal_format = infer_normal_map_format_from_preset(
+                preset,
+                selected_texture_sets=options.get("texture_sets"),
+            )
             if not normal_format:
                 normal_format = get_sp_normal_map_format()
             if normal_format:
@@ -5089,10 +5806,14 @@ def send_to_blender():
                             texture_errors.append(f"{label}: {exc}")
                             append_log(project_dir, f"Export failed ({label}): {exc}")
                             continue
-                        if export_result.status != sp.export.ExportStatus.Success:
+                        if export_result.status not in (
+                                sp.export.ExportStatus.Success, sp.export.ExportStatus.Warning):
                             texture_errors.append(f"{label}: {export_result.message}")
                             append_log(project_dir, f"Export failed ({label}): {export_result.message}")
                             continue
+                        if export_result.status == sp.export.ExportStatus.Warning:
+                            texture_warnings.append(f"{label}: {export_result.message}")
+                            append_log(project_dir, f"Export warning ({label}): {export_result.message}")
                         textures = []
                         for files in export_result.textures.values():
                             for file in files:
@@ -5129,6 +5850,7 @@ def send_to_blender():
 
 _ui_elements = []
 _quick_panel_widget = None
+_ui_retry_pending = False
 _auto_import_timer = None
 _auto_import_last_time = 0.0
 _auto_import_last_path = None
@@ -5144,14 +5866,8 @@ AUTO_IMPORT_SCAN_COOLDOWN = 5.0
 AUTO_IMPORT_ACTIVE_WRITE_INTERVAL = 5.0
 
 
-def start_plugin():
-    global _force_new_token
+def _register_ui_elements():
     global _send_to_blender_action
-    global _plugin_active
-    global _plugin_runtime_token
-    _plugin_runtime_token += 1
-    _plugin_active = True
-    _force_new_token = load_force_new_token()
     action_import = QtGui.QAction("GoB Bridge: Import from Blender")
     action_import.triggered.connect(import_from_blender)
     sp.ui.add_action(sp.ui.ApplicationMenu.File, action_import)
@@ -5173,7 +5889,62 @@ def start_plugin():
             _ui_elements.append(quick_element)
     except Exception:
         pass
+
+
+def _cleanup_ui_elements():
+    global _send_to_blender_action
+    global _quick_panel_widget
+    for element in _ui_elements:
+        try:
+            sp.ui.delete_ui_element(element)
+        except Exception:
+            pass
+    _ui_elements.clear()
+    _send_to_blender_action = None
+    _quick_panel_widget = None
+
+
+def _register_ui_elements_with_retry():
+    global _ui_retry_pending
+    try:
+        _register_ui_elements()
+        return
+    except Exception as exc:
+        # Never leave a half-registered UI behind.
+        _cleanup_ui_elements()
+        if not is_transient_project_error(exc) or _ui_retry_pending:
+            raise
+    _ui_retry_pending = True
+
+    def _retry_register():
+        global _ui_retry_pending
+        _ui_retry_pending = False
+        if not _plugin_active:
+            return
+        try:
+            _register_ui_elements()
+        except Exception:
+            _cleanup_ui_elements()
+
+    try:
+        QtCore.QTimer.singleShot(2000, _retry_register)
+    except Exception:
+        _ui_retry_pending = False
+
+
+def start_plugin():
+    global _force_new_token
+    global _plugin_active
+    global _plugin_runtime_token
+    _plugin_runtime_token += 1
+    _plugin_active = True
+    _force_new_token = load_force_new_token()
+    _register_ui_elements_with_retry()
     write_active_sp_info()
+    try:
+        _register_project_event_hooks()
+    except Exception:
+        pass
     try:
         start_update_check(auto_prompt=True)
     except Exception:
@@ -5238,37 +6009,59 @@ def start_plugin():
 
 
 def close_plugin():
-    global _send_to_blender_action
-    for element in _ui_elements:
-        sp.ui.delete_ui_element(element)
-    _ui_elements.clear()
-    _send_to_blender_action = None
-    global _quick_panel_widget
-    _quick_panel_widget = None
     global _auto_import_timer
+    global _auto_import_last_time
+    global _auto_import_last_path
+    global _auto_import_in_progress
+    global _auto_import_busy_until
+    global _busy_import_callback_key
+    global _plugin_active
+    global _plugin_runtime_token
+    global _force_new_token
+    global _update_check_in_progress
+    global _update_check_active_id
+    global _update_reply
+    global _update_timeout_timer
+    _plugin_active = False
+    _plugin_runtime_token += 1
+    _cleanup_ui_elements()
+    _stop_high_poly_retry()
+    _stop_cage_retry()
+    _cage_logged_events.clear()
+    for callback in list(_project_edition_callbacks):
+        _disconnect_project_edition_entered(callback)
+    _disconnect_all_strong_events()
     if _auto_import_timer is not None:
         try:
             _auto_import_timer.stop()
         except Exception:
             pass
     _auto_import_timer = None
-    global _auto_import_last_time
-    global _auto_import_last_path
+    _update_check_active_id = None
+    _update_check_in_progress = False
+    if _update_timeout_timer is not None:
+        try:
+            _update_timeout_timer.stop()
+        except Exception:
+            pass
+        _update_timeout_timer = None
+    if _update_reply is not None:
+        try:
+            _update_reply.abort()
+        except Exception:
+            pass
+        try:
+            _update_reply.deleteLater()
+        except Exception:
+            pass
+        _update_reply = None
+    _update_status_callbacks.clear()
     _auto_import_last_time = 0.0
     _auto_import_last_path = None
-    global _auto_import_in_progress
-    global _auto_import_busy_until
-    global _busy_import_callback_key
-    global _plugin_active
-    global _plugin_runtime_token
     _auto_import_in_progress = False
     _auto_import_busy_until = 0.0
     _busy_import_callback_key = None
-    _plugin_active = False
-    _plugin_runtime_token += 1
-    global _force_new_token
     _force_new_token = ""
-    write_active_sp_info()
 
 
 if __name__ == "__main__":
