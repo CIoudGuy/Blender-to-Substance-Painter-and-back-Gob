@@ -1,11 +1,11 @@
 {
   "blender": {
-    "version": "0.2.3",
-    "download_url": "https://github.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/releases/download/v0.2.3-Blender%2FSP/gob_blender_0.2.3.zip"
+    "version": "1.0.0",
+    "download_url": "https://files.devalt.cloud/api/app/blender-to-substance-painter-and-back-gob/download/gob_blender_1.0.0.zip"
   },
   "substance_painter": {
-    "version": "0.2.3",
-    "download_url": "https://github.com/CIoudGuy/Blender-to-Substance-Painter-and-back-Gob/releases/download/v0.2.3-Blender%2FSP/gob_sp_0.2.3.zip"
+    "version": "1.0.0",
+    "download_url": "https://files.devalt.cloud/api/app/blender-to-substance-painter-and-back-gob/download/gob_sp.py"
   },
-  "notes": "Initial public release."
+  "notes": "Updates now live on files.devalt.cloud; this is the final GitHub-based update."
 }
